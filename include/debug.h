@@ -23,3 +23,9 @@
 #else
 #define DBG_INFO(fmt, ...) do {} while (0)
 #endif
+
+#if DEBUG_LEVEL >= 4
+#define DBG_VERBOSE(fmt, ...) Serial.printf("[VERB]  " fmt "\n", ##__VA_ARGS__)
+#else
+#define DBG_VERBOSE(fmt, ...) do {} while (0)
+#endif

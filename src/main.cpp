@@ -4,6 +4,7 @@
 #include <LovyanGFX.hpp>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <PNGdec.h>
@@ -48,7 +49,44 @@ const char* owmLayerIds[] = {"", "clouds_new", "precipitation_new"};
 
 WaveshareDisplay gfx;
 WaveshareDisplay& lcd = gfx;
-LGFX_Sprite mapCanvas(&lcd);
+LGFX_Sprite renderScratch(&lcd);
+LGFX_Sprite cacheRadar(&lcd);
+LGFX_Sprite cacheClouds(&lcd);
+LGFX_Sprite cacheRain(&lcd);
+LGFX_Sprite* layerCacheSprites[] = {&cacheRadar, &cacheClouds, &cacheRain};
+LGFX_Sprite* mapFront     = &cacheRadar;
+LGFX_Sprite* renderTarget = &renderScratch;
+
+struct LayerCacheState {
+  bool valid;
+  int zoom;
+  int mapStyle;
+  unsigned long updatedMs;
+};
+
+LayerCacheState layerCaches[3] = {};
+
+enum RenderState : uint8_t { RENDER_IDLE, RENDER_BUSY, RENDER_READY };
+volatile RenderState renderState = RENDER_IDLE;
+volatile bool renderPending  = false;
+bool          firstRenderDone = false;
+unsigned long layerCycleLastMs = 0;
+unsigned long realtimeRefreshLastMs = 0;
+TaskHandle_t  renderTaskHandle = nullptr;
+int renderLayerStyle = 0;
+int renderMapStyle = 0;
+int renderZoom = 0;
+int pendingLayerStyle = 0;
+bool pendingRenderForce = false;
+volatile int  renderTilesDone  = 0;
+volatile int  renderTilesTotal = 0;
+volatile int  renderDiagTileIndex = 0;
+volatile int  renderDiagTileX = 0;
+volatile int  renderDiagTileY = 0;
+volatile unsigned long renderDiagPhaseStartedMs = 0;
+volatile unsigned long renderDiagLastProgressMs = 0;
+char renderDiagPhase[24] = "idle";
+char renderDiagUrl[180] = "";
 
 constexpr int kTileSize = 256;
 constexpr int kMapCanvasHeight = 415;
@@ -64,6 +102,7 @@ int dCode[16];
 void setBrightnessFromTouchY(int ty);
 void getWeatherData();
 void renderRadarMap();
+void triggerRenderForLayer(int targetLayer, bool forceRefresh = false);
 void drawBottomDashboard();
 void drawSideButtons();
 void drawSignature();
@@ -74,6 +113,7 @@ void drawWeatherIcon(int x, int y, int code);
 void drawMiniWeatherIcon(int x, int y, int code);
 int getDayOfMonthOffset(struct tm baseTime, int offsetDays);
 bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* httpStatus = nullptr);
+void updateLoadingProgress();
 
 #include "touch.h"
 PNG png;
@@ -296,7 +336,7 @@ int pngDrawCanvas(PNGDRAW *pDraw) {
   for (int x = 0; x < pDraw->iWidth; x++) {
     pix[x] = enhanceBaseMapPixel(pix[x]);
   }
-  mapCanvas.pushImage(globalX, globalY + pDraw->y, pDraw->iWidth, 1, pix);
+  renderTarget->pushImage(globalX, globalY + pDraw->y, pDraw->iWidth, 1, pix);
   return 1;
 }
 
@@ -312,7 +352,7 @@ int pngDrawOverlayCanvas(PNGDRAW *pDraw) {
       if (((globalX + x + globalY + pDraw->y) & 1) != 0) continue;
     }
 
-    mapCanvas.drawPixel(globalX + x, globalY + pDraw->y, c);
+    renderTarget->drawPixel(globalX + x, globalY + pDraw->y, c);
   }
   return 1;
 }
@@ -354,18 +394,99 @@ String redactUrlForLog(const String& url) {
   return redacted;
 }
 
+uint32_t renderStackHighWater() {
+  return renderTaskHandle ? (uint32_t)uxTaskGetStackHighWaterMark(renderTaskHandle) : 0;
+}
+
+uint32_t largestInternalBlock() {
+  return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+}
+
+uint32_t largestPsramBlock() {
+  return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+void setRenderDiagPhase(const char* phase) {
+  strlcpy(renderDiagPhase, phase, sizeof(renderDiagPhase));
+  renderDiagPhaseStartedMs = millis();
+}
+
+void setRenderDiagContext(const char* phase, int tileIndex, int tileX, int tileY, const String& url) {
+  renderDiagTileIndex = tileIndex;
+  renderDiagTileX = tileX;
+  renderDiagTileY = tileY;
+  String safeUrl = redactUrlForLog(url);
+  strlcpy(renderDiagUrl, safeUrl.c_str(), sizeof(renderDiagUrl));
+  renderDiagLastProgressMs = millis();
+  setRenderDiagPhase(phase);
+}
+
+void clearRenderDiag() {
+  renderDiagTileIndex = renderTilesDone;
+  renderDiagTileX = 0;
+  renderDiagTileY = 0;
+  renderDiagUrl[0] = '\0';
+  renderDiagLastProgressMs = millis();
+  setRenderDiagPhase("idle");
+}
+
+bool layerCacheMatches(int targetLayer) {
+  if (targetLayer < 0 || targetLayer > 2) return false;
+  LayerCacheState& cache = layerCaches[targetLayer];
+  return cache.valid && cache.zoom == myZoom && cache.mapStyle == mapStyle;
+}
+
+bool layerCacheFresh(int targetLayer) {
+  if (!layerCacheMatches(targetLayer)) return false;
+  unsigned long ageMs = millis() - layerCaches[targetLayer].updatedMs;
+  return ageMs < (unsigned long)cfg::kRealtimeRefreshSecs * 1000UL;
+}
+
+void invalidateLayerCaches() {
+  for (int i = 0; i < 3; i++) {
+    layerCaches[i].valid = false;
+  }
+}
+
+void markLayerCacheUpdated(int targetLayer) {
+  if (targetLayer < 0 || targetLayer > 2) return;
+  layerCaches[targetLayer].valid = true;
+  layerCaches[targetLayer].zoom = renderZoom;
+  layerCaches[targetLayer].mapStyle = renderMapStyle;
+  layerCaches[targetLayer].updatedMs = millis();
+}
+
+unsigned long layerCacheAgeSecs(int targetLayer) {
+  if (targetLayer < 0 || targetLayer > 2 || !layerCaches[targetLayer].valid) return 0;
+  return (millis() - layerCaches[targetLayer].updatedMs) / 1000UL;
+}
+
 bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* httpStatus) {
   *outBuf = nullptr;
   *outLen = 0;
   if (httpStatus) *httpStatus = 0;
 
+  unsigned long fetchStart = millis();
+  String safeUrl = redactUrlForLog(url);
+  DBG_INFO("Fetch start | tile=%d/%d | phase=%s | heap=%u largest=%u psram=%u stackHW=%u | %s",
+           renderDiagTileIndex, renderTilesTotal, renderDiagPhase,
+           ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
+           renderStackHighWater(), safeUrl.c_str());
+
+  // Explicit client with stream timeout so TLS handshake can't hang indefinitely.
+  // http.begin(url) creates an internal client with no timeout — fatal when heap is fragmented.
+  WiFiClientSecure secClient;
+  secClient.setInsecure();
+  secClient.setTimeout(15);  // seconds — caps TLS handshake + stream read
+
   HTTPClient http;
   http.setTimeout(15000);
+  http.setConnectTimeout(15000);
 
-  if (!http.begin(url)) {
+  setRenderDiagPhase("http_begin");
+  if (!http.begin(secClient, url)) {
     if (httpStatus) *httpStatus = -1;
-    String safeUrl = redactUrlForLog(url);
-    Serial.printf("HTTP begin failed: %s\n", safeUrl.c_str());
+    DBG_WARN("HTTP begin failed: %s", safeUrl.c_str());
     return false;
   }
 
@@ -374,11 +495,11 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
   http.addHeader("User-Agent", "ESP32-WeatherDisplay/1.0");
   http.useHTTP10(true);   // pomaga kaj nekoi tile serveri
 	
+  setRenderDiagPhase("http_get");
   int code = http.GET();
   if (httpStatus) *httpStatus = code;
   if (code != HTTP_CODE_OK) {
-    String safeUrl = redactUrlForLog(url);
-    Serial.printf("HTTP GET failed: %d | %s\n", code, safeUrl.c_str());
+    DBG_WARN("HTTP GET failed: %d | %lums | %s", code, millis() - fetchStart, safeUrl.c_str());
     http.end();
     return false;
   }
@@ -387,17 +508,19 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
   String cenc  = http.header("Content-Encoding");
   int len = http.getSize();
 
-  Serial.printf("HTTP 200 | type=%s | enc=%s | len=%d\n",
-                ctype.c_str(), cenc.c_str(), len);
+  DBG_INFO("HTTP 200 | tile=%d/%d | get=%lums | type=%s | enc=%s | len=%d",
+           renderDiagTileIndex, renderTilesTotal, millis() - fetchStart,
+           ctype.c_str(), cenc.c_str(), len);
 
   WiFiClient* stream = http.getStreamPtr();
 
   // Ako nema content-length, citaj stream rachno
   if (len <= 0) {
+    setRenderDiagPhase("http_read_chunked");
     const size_t maxChunkedSize = 100000;
     uint8_t* buf = (uint8_t*)ps_malloc(maxChunkedSize);
     if (!buf) {
-      Serial.println("PSRAM alloc failed (chunked)");
+      DBG_ERROR("PSRAM alloc failed (chunked)");
       http.end();
       return false;
     }
@@ -408,7 +531,7 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     while (http.connected() && (millis() - t0 < 15000)) {
       while (stream->available()) {
         if (total >= maxChunkedSize) {
-          Serial.println("Chunked payload too large");
+          DBG_WARN("Chunked payload too large");
           free(buf);
           http.end();
           return false;
@@ -420,7 +543,7 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     }
 
     if (total < 16) {
-      Serial.printf("Payload too small: %u bytes\n", (unsigned)total);
+      DBG_WARN("Payload too small: %u bytes", (unsigned)total);
       free(buf);
       http.end();
       return false;
@@ -429,27 +552,38 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     *outBuf = buf;
     *outLen = total;
     http.end();
+    setRenderDiagPhase("fetch_done");
+    DBG_INFO("Fetch done | tile=%d/%d | bytes=%u | %lums | heap=%u largest=%u stackHW=%u",
+             renderDiagTileIndex, renderTilesTotal, (unsigned)total,
+             millis() - fetchStart, ESP.getFreeHeap(), largestInternalBlock(),
+             renderStackHighWater());
     return true;
   }
 
   uint8_t* buf = (uint8_t*)ps_malloc(len);
   if (!buf) {
-    Serial.printf("PSRAM alloc failed: %d bytes\n", len);
+    DBG_ERROR("PSRAM alloc failed: %d bytes", len);
     http.end();
     return false;
   }
 
+  setRenderDiagPhase("http_read");
   size_t actuallyRead = readHttpPayload(stream, buf, (size_t)len, 15000);
   http.end();
 
   if (actuallyRead != (size_t)len || len < 16) {
-    Serial.printf("Read failed: expected %d got %u\n", len, (unsigned)actuallyRead);
+    DBG_WARN("Read failed: expected %d got %u | %lums", len, (unsigned)actuallyRead, millis() - fetchStart);
     free(buf);
     return false;
   }
 
   *outBuf = buf;
   *outLen = len;
+  setRenderDiagPhase("fetch_done");
+  DBG_INFO("Fetch done | tile=%d/%d | bytes=%u | %lums | heap=%u largest=%u stackHW=%u",
+           renderDiagTileIndex, renderTilesTotal, (unsigned)len,
+           millis() - fetchStart, ESP.getFreeHeap(), largestInternalBlock(),
+           renderStackHighWater());
   return true;
 }
 
@@ -514,7 +648,7 @@ static bool initWiFi() {
     WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
   }
 
-  return wm.autoConnect(WIFI_AP_NAME);
+  return wm.autoConnect(cfg::kWifiApName);
 }
 
 void drawProgressTimer() {
@@ -526,8 +660,8 @@ void drawProgressTimer() {
   lcd.drawRect(bx + 2, by + 2, bw - 4, bh - 4, TFT_WHITE);
   lcd.fillRect(bx + 3, by + 3, bw - 6, bh - 6, TFT_BLACK);
 
-  // Progress do sledezen update
-  float p = (float)(millis() - lastUpdate) / 600000.0;
+  // Progress do sledezen realtime update
+  float p = (float)(millis() - lastUpdate) / ((float)cfg::kRealtimeRefreshSecs * 1000.0f);
   if (p > 1.0) p = 1.0;
   int cH = (int)(397 * p);
 
@@ -616,6 +750,7 @@ void drawBottomDashboard() {
 }
 
 void getWeatherData() {
+  unsigned long t0 = millis();
   HTTPClient http;
   http.setTimeout(20000);
 
@@ -638,8 +773,8 @@ void getWeatherData() {
     DeserializationError err = deserializeJson(doc, payload);
 
     if (err) {
-      Serial.printf("Forecast JSON parse failed: %s | payload=%u | PSRAM=%u\n",
-                    err.c_str(), (unsigned)payload.length(), ESP.getFreePsram());
+      DBG_ERROR("Forecast JSON parse failed: %s | payload=%u | PSRAM=%u",
+                err.c_str(), (unsigned)payload.length(), ESP.getFreePsram());
     } else {
       JsonArray hourlyTemp = doc["hourly"]["temperature_2m"].as<JsonArray>();
       JsonArray hourlyCode = doc["hourly"]["weather_code"].as<JsonArray>();
@@ -670,8 +805,8 @@ void getWeatherData() {
         dailySolar.size() >= 16;
 
       if (!hasForecast) {
-        Serial.printf("Forecast JSON missing fields | hourlyTemp=%u hourlyPress=%u dailyMax=%u\n",
-                      (unsigned)hourlyTemp.size(), (unsigned)hourlyPress.size(), (unsigned)dailyMax.size());
+        DBG_WARN("Forecast JSON missing fields | hourlyTemp=%u hourlyPress=%u dailyMax=%u",
+                 (unsigned)hourlyTemp.size(), (unsigned)hourlyPress.size(), (unsigned)dailyMax.size());
       } else {
         currentTemp = doc["current"]["temperature_2m"];
         morningTemp = hourlyTemp[9];
@@ -695,12 +830,12 @@ void getWeatherData() {
           dSolar[i] = dailySolar[i];
         }
 
-        Serial.printf("Forecast OK: %s | %.1f C | %u bytes\n",
-                      cfg::kLocationName, currentTemp, (unsigned)payload.length());
+        DBG_INFO("Weather OK: %s | %.1f C | 16d forecast | %lums",
+                 cfg::kLocationName, currentTemp, millis() - t0);
       }
     }
   } else {
-    Serial.printf("Forecast HTTP failed: %d | %s\n", weatherCode, weatherUrl.c_str());
+    DBG_WARN("Forecast HTTP failed: %d | %s", weatherCode, weatherUrl.c_str());
   }
   http.end();
 
@@ -717,13 +852,13 @@ if (http.GET() == 200) {
   if (!past.isNull() && past.size() > 0) {
     radarTS = past[past.size() - 1]["time"] | 0;
     radarPath = (const char*)past[past.size() - 1]["path"];
-    Serial.printf("RainViewer frame time=%ld\n", radarTS);
-    Serial.printf("RainViewer path=%s\n", radarPath.c_str());
+    DBG_VERBOSE("RainViewer frame time=%ld", radarTS);
+    DBG_VERBOSE("RainViewer path=%s", radarPath.c_str());
   } else {
-    Serial.println("RainViewer: no past radar frames available");
+    DBG_WARN("RainViewer: no past radar frames available");
   }
 } else {
-  Serial.println("RainViewer API request failed");
+  DBG_WARN("RainViewer API request failed");
 }
 http.end();
 }
@@ -1003,24 +1138,23 @@ void drawLocationMarker() {
   int py = kMapCanvasHeight / 2;
 
   // Marker
-  mapCanvas.fillCircle(px, py, 5, TFT_RED);
-  mapCanvas.drawCircle(px, py, 6, TFT_WHITE);
-  mapCanvas.drawPixel(px, py, TFT_WHITE);
+  renderTarget->fillCircle(px, py, 5, TFT_RED);
+  renderTarget->drawCircle(px, py, 6, TFT_WHITE);
+  renderTarget->drawPixel(px, py, TFT_WHITE);
 }
 
 void renderRadarMap() {
-  if (appState == 0) {
-    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.setTextSize(3);
-    lcd.setTextDatum(middle_center);
-    lcd.drawString("Loading map...", 400, 200);
-  }
+  unsigned long renderStart = millis();
+  int tilesOk = 0, tilesErr = 0;
+  int targetLayer = renderLayerStyle;
+  int targetMapStyle = renderMapStyle;
+  int targetZoom = renderZoom;
 
-  mapCanvas.fillSprite(TFT_BLACK);
+  renderTarget->fillSprite(TFT_BLACK);
 
   double centerWorldX = 0.0;
   double centerWorldY = 0.0;
-  latLonToWorldPixels(myLat, myLon, myZoom, &centerWorldX, &centerWorldY);
+  latLonToWorldPixels(myLat, myLon, targetZoom, &centerWorldX, &centerWorldY);
 
   double topLeftWorldX = centerWorldX - (cfg::kScreenWidth / 2.0);
   double topLeftWorldY = centerWorldY - (kMapCanvasHeight / 2.0);
@@ -1028,15 +1162,24 @@ void renderRadarMap() {
   int endTX = (int)floor((topLeftWorldX + cfg::kScreenWidth - 1) / kTileSize);
   int startTY = (int)floor(topLeftWorldY / kTileSize);
   int endTY = (int)floor((topLeftWorldY + kMapCanvasHeight - 1) / kTileSize);
-  int tileCount = 1 << myZoom;
+  int tileCount = 1 << targetZoom;
+  renderTilesDone  = 0;
+  renderTilesTotal = (endTX - startTX + 1) * (endTY - startTY + 1);
+  renderDiagLastProgressMs = millis();
+  setRenderDiagPhase("render_start");
+  DBG_INFO("Map render start | layer=%s zoom=%d map=%s | %d tiles | x=%d..%d y=%d..%d | heap=%u largest=%u psram=%u psramLargest=%u stackHW=%u",
+           layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], renderTilesTotal,
+           startTX, endTX, startTY, endTY,
+           ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
+           largestPsramBlock(), renderStackHighWater());
   bool skipOwmOverlay = false;
 
-  if (layerStyle != 0) {
+  if (targetLayer != 0) {
     if (strlen(owmApiKey) == 0) {
-      Serial.println("OpenWeatherMap API key missing; skipping CLOUDS/RAIN overlay.");
+      DBG_WARN("OpenWeatherMap API key missing — skipping CLOUDS/RAIN overlay");
       skipOwmOverlay = true;
     } else if (owmAuthFailed) {
-      Serial.println("OpenWeatherMap auth previously failed; skipping CLOUDS/RAIN overlay until reboot/key update.");
+      DBG_WARN("OpenWeatherMap auth previously failed — skipping CLOUDS/RAIN overlay until reboot");
       skipOwmOverlay = true;
     }
   }
@@ -1045,40 +1188,63 @@ void renderRadarMap() {
     for (int tileY = startTY; tileY <= endTY; tileY++) {
       if (tileY < 0 || tileY >= tileCount) continue;
 
+      // Guard against attempting a TLS handshake when heap is too fragmented.
+      // mbedTLS needs ~40KB contiguous; below 80KB we skip rather than hang.
+      if (ESP.getFreeHeap() < 80000) {
+        DBG_WARN("Tile %d/%d skipped — heap low: %u bytes",
+                 renderTilesDone + 1, renderTilesTotal, ESP.getFreeHeap());
+        renderTilesDone += 1;
+        renderDiagLastProgressMs = millis();
+        continue;
+      }
+
       int wrappedTileX = ((tileX % tileCount) + tileCount) % tileCount;
       globalX = (int)round((tileX * kTileSize) - topLeftWorldX);
       globalY = (int)round((tileY * kTileSize) - topLeftWorldY);
 
-      String mU = String(mapUrls[mapStyle]) + String(myZoom) + "/" + String(wrappedTileX) + "/" + String(tileY) + ".png";
+      String mU = String(mapUrls[targetMapStyle]) + String(targetZoom) + "/" + String(wrappedTileX) + "/" + String(tileY) + ".png";
 
       uint8_t* baseBuf = nullptr;
       size_t baseLen = 0;
 
+      int tileIndex = renderTilesDone + 1;
+      setRenderDiagContext("base_fetch", tileIndex, wrappedTileX, tileY, mU);
+      DBG_INFO("Tile %d/%d base start | layer=%s z=%d x=%d y=%d | screen=%d,%d | heap=%u largest=%u",
+               tileIndex, renderTilesTotal, layerNames[targetLayer], targetZoom, wrappedTileX, tileY,
+               globalX, globalY, ESP.getFreeHeap(), largestInternalBlock());
+
       if (fetchPngToBuffer(mU, &baseBuf, &baseLen)) {
+        setRenderDiagPhase("base_decode");
+        unsigned long decodeStart = millis();
         if (png.openRAM(baseBuf, baseLen, pngDrawCanvas) == PNG_SUCCESS) {
           png.decode(NULL, 0);
           png.close();
+          tilesOk++;
+          DBG_INFO("Tile %d/%d base decoded | bytes=%u | %lums",
+                   tileIndex, renderTilesTotal, (unsigned)baseLen, millis() - decodeStart);
         } else {
-          Serial.printf("Base PNG open failed: %s\n", mU.c_str());
+          DBG_WARN("Base PNG open failed: %s", mU.c_str());
+          tilesErr++;
         }
         free(baseBuf);
       } else {
-        Serial.printf("Base fetch failed: %s\n", mU.c_str());
+        DBG_WARN("Base fetch failed: %s", mU.c_str());
+        tilesErr++;
       }
 
       String layerUrl = "";
 
-if (layerStyle == 0) {
+if (targetLayer == 0) {
 	  if (radarPath.length() > 0) {
 	    layerUrl = radarHost + radarPath + "/256/" +
-	               String(myZoom) + "/" +
+	               String(targetZoom) + "/" +
 	               String(wrappedTileX) + "/" +
 	               String(tileY) + "/1/1_1.png";
 	  }
 		} else if (!skipOwmOverlay) {
 	        layerUrl = "https://tile.openweathermap.org/map/" +
-	                   String(owmLayerIds[layerStyle]) + "/" +
-	                   String(myZoom) + "/" +
+	                   String(owmLayerIds[targetLayer]) + "/" +
+	                   String(targetZoom) + "/" +
 	                   String(wrappedTileX) + "/" +
 	                   String(tileY) +
 	                   ".png?appid=" + String(owmApiKey);
@@ -1088,11 +1254,12 @@ if (layerStyle == 0) {
   uint8_t* overlayBuf = nullptr;
   size_t overlayLen = 0;
 
-	  Serial.printf("Layer=%s\n", layerNames[layerStyle]);
-	  String safeLayerUrl = redactUrlForLog(layerUrl);
-	  Serial.printf("URL=%s\n", safeLayerUrl.c_str());
-	  Serial.printf("Heap=%u PSRAM=%u\n", ESP.getFreeHeap(), ESP.getFreePsram());
-	
+    String safeLayerUrl = redactUrlForLog(layerUrl);
+    setRenderDiagContext("overlay_fetch", tileIndex, wrappedTileX, tileY, layerUrl);
+    DBG_INFO("Tile %d/%d overlay start | layer=%s | heap=%u largest=%u | %s",
+             tileIndex, renderTilesTotal, layerNames[targetLayer],
+             ESP.getFreeHeap(), largestInternalBlock(), safeLayerUrl.c_str());
+
     int overlayStatus = 0;
 	  if (fetchPngToBuffer(layerUrl, &overlayBuf, &overlayLen, &overlayStatus)) {
 
@@ -1109,76 +1276,66 @@ if (layerStyle == 0) {
       overlayBuf[7] == 0x0A;
 
     if (!isPng) {
-      Serial.printf("Overlay is NOT PNG! len=%u\n", (unsigned)overlayLen);
-      Serial.print("First 32 bytes HEX: ");
+      DBG_WARN("Overlay is NOT PNG! len=%u", (unsigned)overlayLen);
+#if DEBUG_LEVEL >= 4
+      Serial.print("[VERB]  First 32 bytes HEX: ");
       for (size_t k = 0; k < 32 && k < overlayLen; k++) {
         Serial.printf("%02X ", overlayBuf[k]);
       }
       Serial.println();
-
-      Serial.print("First 120 chars TXT: ");
+      Serial.print("[VERB]  First 120 chars TXT: ");
       for (size_t k = 0; k < 120 && k < overlayLen; k++) {
         char c = (char)overlayBuf[k];
         if (c >= 32 && c <= 126) Serial.print(c);
         else Serial.print('.');
       }
       Serial.println();
-
+#endif
       free(overlayBuf);
     } else {
+      setRenderDiagPhase("overlay_decode");
+      unsigned long decodeStart = millis();
       int rc = png.openRAM(overlayBuf, overlayLen, pngDrawOverlayCanvas);
       if (rc == PNG_SUCCESS) {
         int decRc = png.decode(NULL, 0);
         if (decRc != PNG_SUCCESS) {
-          Serial.printf("PNG decode failed rc=%d | %s\n", decRc, layerUrl.c_str());
+          DBG_WARN("PNG decode failed rc=%d", decRc);
         }
         png.close();
+        DBG_INFO("Tile %d/%d overlay decoded | bytes=%u | %lums",
+                 tileIndex, renderTilesTotal, (unsigned)overlayLen, millis() - decodeStart);
       } else {
-        Serial.printf("Overlay PNG open failed rc=%d | %s\n", rc, layerUrl.c_str());
+        DBG_WARN("Overlay PNG open failed rc=%d", rc);
       }
       free(overlayBuf);
     }
 
   } else {
-    if (overlayStatus == HTTP_CODE_UNAUTHORIZED && layerStyle != 0) {
+    if (overlayStatus == HTTP_CODE_UNAUTHORIZED && targetLayer != 0) {
       owmAuthFailed = true;
-      Serial.println("OpenWeatherMap overlay unauthorized (401). Check that SECRET_OWM_API_KEY is correct, active, and has Weather Maps access.");
+      DBG_ERROR("OpenWeatherMap overlay unauthorized (401) — check SECRET_OWM_API_KEY");
     } else {
-      Serial.printf("Overlay fetch failed: %s\n", safeLayerUrl.c_str());
+      DBG_WARN("Overlay fetch failed: %s", safeLayerUrl.c_str());
     }
   }
 }
 
-      delay(10);
+      renderTilesDone += 1;
+      renderDiagLastProgressMs = millis();
+      DBG_INFO("Tile %d/%d done | ok=%d err=%d | heap=%u largest=%u psram=%u stackHW=%u",
+               renderTilesDone, renderTilesTotal, tilesOk, tilesErr,
+               ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
+               renderStackHighWater());
+      delay(50);  // yield between tiles — lets FreeRTOS process deferred heap cleanup
     }
   }
 
-    drawLocationMarker();
-    mapCanvas.pushSprite(0, 0);
-
-  int mapX = 740;
-  int mapY = 387;
-  int mapW = 60;
-  int mapH = 22;
-
-  lcd.fillRect(mapX, mapY, mapW, mapH, panelColor);
-  lcd.drawRect(mapX, mapY, mapW, mapH, TFT_WHITE);
-  lcd.setTextColor(TFT_WHITE);
-  lcd.setTextSize(1);
-  lcd.setTextDatum(middle_center);
-  lcd.drawString(mapNames[mapStyle], mapX + (mapW / 2), mapY + (mapH / 2));
-
-  int layerX = 360;
-  int layerY = 10;
-  int layerW = 70;
-  int layerH = 22;
-
-  lcd.fillRect(layerX, layerY, layerW, layerH, panelColor);
-  lcd.drawRect(layerX, layerY, layerW, layerH, TFT_WHITE);
-  lcd.setTextColor(TFT_WHITE);
-  lcd.setTextSize(1);
-  lcd.setTextDatum(middle_center);
-  lcd.drawString(layerNames[layerStyle], layerX + (layerW / 2), layerY + (layerH / 2));
+  setRenderDiagPhase("marker");
+  drawLocationMarker();
+  DBG_INFO("Map render | layer=%s zoom=%d map=%s | %d ok %d err | %lums | heap=%u",
+           layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], tilesOk, tilesErr,
+           millis() - renderStart, ESP.getFreeHeap());
+  clearRenderDiag();
 }
 
 void drawTopDate() {
@@ -1236,6 +1393,246 @@ void drawSideButtons() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// drawMapBadges — map-style and layer-name overlay badges on the LCD.
+// Must only be called from Core 0 after a sprite push.
+// ---------------------------------------------------------------------------
+void drawMapBadges() {
+  int mapX = 740, mapY = 387, mapW = 60, mapH = 22;
+  lcd.fillRect(mapX, mapY, mapW, mapH, panelColor);
+  lcd.drawRect(mapX, mapY, mapW, mapH, TFT_WHITE);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.setTextDatum(middle_center);
+  lcd.drawString(mapNames[mapStyle], mapX + mapW / 2, mapY + mapH / 2);
+
+  int layerX = 360, layerY = 10, layerW = 70, layerH = 22;
+  lcd.fillRect(layerX, layerY, layerW, layerH, panelColor);
+  lcd.drawRect(layerX, layerY, layerW, layerH, TFT_WHITE);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.setTextDatum(middle_center);
+  lcd.drawString(layerNames[layerStyle], layerX + layerW / 2, layerY + layerH / 2);
+}
+
+// ---------------------------------------------------------------------------
+// triggerRenderForLayer — request a background render only when the cache is
+// missing/stale/forced. Fresh layer caches are pushed by the main loop without
+// touching network APIs.
+// ---------------------------------------------------------------------------
+void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
+  if (renderTaskHandle == nullptr) {
+    DBG_ERROR("Render request ignored — RenderTask is not available");
+    return;
+  }
+
+  if (targetLayer < 0 || targetLayer > 2) targetLayer = 0;
+
+  if (!forceRefresh && layerCacheFresh(targetLayer)) {
+    mapFront = layerCacheSprites[targetLayer];
+    DBG_INFO("Layer cache hit | layer=%s age=%lus | zoom=%d map=%s",
+             layerNames[targetLayer], layerCacheAgeSecs(targetLayer), myZoom, mapNames[mapStyle]);
+
+    if (renderState == RENDER_BUSY) {
+      if (firstRenderDone && appState == 0) {
+        lcd.fillScreen(TFT_BLACK);
+        mapFront->pushSprite(0, 0);
+        drawMapBadges();
+        drawTopDate();
+        drawBottomDashboard();
+        drawSideButtons();
+        drawSignature();
+        drawProgressTimer();
+      }
+      return;
+    }
+
+    renderState = RENDER_READY;
+    return;
+  }
+
+  if (renderState == RENDER_BUSY) {
+    renderPending = true;
+    pendingLayerStyle = targetLayer;
+    pendingRenderForce = forceRefresh;
+    DBG_INFO("Render queued | layer=%s force=%d", layerNames[targetLayer], forceRefresh ? 1 : 0);
+    return;
+  }
+  renderTarget = &renderScratch;
+  renderLayerStyle = targetLayer;
+  renderMapStyle = mapStyle;
+  renderZoom = myZoom;
+  renderState = RENDER_BUSY;
+  DBG_INFO("Render scheduled | layer=%s force=%d cacheValid=%d cacheAge=%lus refresh=%ds",
+           layerNames[targetLayer], forceRefresh ? 1 : 0,
+           layerCaches[targetLayer].valid ? 1 : 0,
+           layerCacheAgeSecs(targetLayer),
+           cfg::kRealtimeRefreshSecs);
+  xTaskNotifyGive(renderTaskHandle);
+}
+
+// ---------------------------------------------------------------------------
+// drawStartupScreen — full-screen info panel shown while first render loads.
+// ---------------------------------------------------------------------------
+void drawStartupScreen(bool wifiOk, const char* ssid, const char* ip) {
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextDatum(middle_center);
+
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(3);
+  lcd.drawString("ESP32S3-Weather  v" + String(kFwVersion), 400, 55);
+
+  lcd.setTextColor(TFT_YELLOW);
+  lcd.setTextSize(2);
+  lcd.drawString(cfg::kLocationName, 400, 105);
+
+  if (wifiOk) {
+    lcd.setTextColor(TFT_GREEN);
+    char wBuf[80];
+    snprintf(wBuf, sizeof(wBuf), "WiFi: %s   %s", ssid, ip);
+    lcd.drawString(wBuf, 400, 150);
+  } else {
+    lcd.setTextColor(TFT_RED);
+    lcd.drawString("WiFi: not connected", 400, 150);
+  }
+
+  lcd.setTextColor(TFT_LIGHTGREY);
+  lcd.drawString(cfg::kNtpTimezone, 400, 190);
+
+  char mBuf[64];
+  snprintf(mBuf, sizeof(mBuf), "PSRAM: %uKB free   Heap: %uKB free",
+           ESP.getFreePsram() / 1024, ESP.getFreeHeap() / 1024);
+  lcd.drawString(mBuf, 400, 230);
+
+  lcd.setTextColor(strlen(owmApiKey) > 0 ? TFT_GREEN : TFT_DARKGREY);
+  lcd.drawString(strlen(owmApiKey) > 0 ? "OWM: key present" : "OWM: no key  (RADAR only)", 400, 270);
+
+  char cBuf[72];
+  snprintf(cBuf, sizeof(cBuf), "Layer cycle: %ds   Realtime: %dmin",
+           cfg::kLayerCycleSecs, cfg::kRealtimeRefreshSecs / 60);
+  lcd.setTextColor(TFT_DARKGREY);
+  lcd.drawString(cBuf, 400, 310);
+
+  lcd.setTextColor(TFT_CYAN);
+  lcd.setTextSize(3);
+  lcd.drawString("Loading map...", 400, 390);
+}
+
+// ---------------------------------------------------------------------------
+// updateLoadingProgress — draws progress bar on startup screen.
+// Called from loop() while !firstRenderDone. Redraws only when tile count
+// changes to avoid display bus thrash.
+// ---------------------------------------------------------------------------
+void updateLoadingProgress() {
+  static int lastDrawn = -1;
+  int done  = renderTilesDone;
+  int total = renderTilesTotal;
+  if (done == lastDrawn) return;
+  lastDrawn = done;
+
+  constexpr int barX = 80;
+  constexpr int barY = 420;
+  constexpr int barW = 640;
+  constexpr int barH = 18;
+
+  lcd.drawRect(barX, barY, barW, barH, TFT_DARKGREY);
+  if (total > 0) {
+    int filled = (int)((long)done * barW / total);
+    if (filled > 0) lcd.fillRect(barX, barY, filled, barH, TFT_CYAN);
+    if (filled < barW) lcd.fillRect(barX + filled, barY, barW - filled, barH, TFT_BLACK);
+  }
+
+  lcd.setTextDatum(middle_center);
+  lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  lcd.setTextSize(1);
+  char buf[32];
+  if (total > 0) snprintf(buf, sizeof(buf), "%d / %d tiles", done, total);
+  else           snprintf(buf, sizeof(buf), "Fetching tiles...");
+  lcd.drawString(buf, 400, 448);
+}
+
+// ---------------------------------------------------------------------------
+// logStartupBanner — serial summary printed once at end of setup().
+// ---------------------------------------------------------------------------
+void logStartupBanner(bool wifiOk, const char* ip) {
+  DBG_INFO("=== ESP32S3-Weather v%s ===========================", kFwVersion);
+  DBG_INFO("Location  : %s (%.4f, %.4f)",
+           cfg::kLocationName, cfg::kLocationLatitude, cfg::kLocationLongitude);
+  if (wifiOk) {
+    DBG_INFO("WiFi      : connected | SSID: %s | IP: %s", WiFi.SSID().c_str(), ip);
+    DBG_INFO("NTP       : configured | TZ: %s", cfg::kNtpTimezone);
+  } else {
+    DBG_INFO("WiFi      : NOT connected");
+  }
+  DBG_INFO("PSRAM free: %u bytes", ESP.getFreePsram());
+  DBG_INFO("Heap free : %u bytes", ESP.getFreeHeap());
+  DBG_INFO("OWM key   : %s | Layer cycle: %ds | Realtime refresh: %ds",
+           strlen(owmApiKey) > 0 ? "present" : "absent (RADAR only)",
+           cfg::kLayerCycleSecs, cfg::kRealtimeRefreshSecs);
+  DBG_INFO("============================================================");
+}
+
+// ---------------------------------------------------------------------------
+// pollRenderWatchdog — Core 0/loop-side visibility into a stuck render task.
+// It cannot interrupt a blocking TLS/HTTP call, but it tells us exactly which
+// phase and URL were active when progress stopped.
+// ---------------------------------------------------------------------------
+void pollRenderWatchdog() {
+  static unsigned long lastWarnMs = 0;
+
+  if (renderState != RENDER_BUSY) {
+    lastWarnMs = 0;
+    return;
+  }
+
+  unsigned long now = millis();
+  unsigned long phaseAge = now - renderDiagPhaseStartedMs;
+  unsigned long progressAge = now - renderDiagLastProgressMs;
+
+  if (phaseAge < cfg::kRenderStallWarnMs && progressAge < cfg::kRenderStallWarnMs) return;
+  if (lastWarnMs != 0 && now - lastWarnMs < cfg::kRenderStallRepeatMs) return;
+  lastWarnMs = now;
+
+  char phase[sizeof(renderDiagPhase)];
+  char url[sizeof(renderDiagUrl)];
+  strlcpy(phase, renderDiagPhase, sizeof(phase));
+  strlcpy(url, renderDiagUrl, sizeof(url));
+
+  DBG_WARN("Render busy %lums | phase=%s age=%lums | tile=%d/%d x=%d y=%d | heap=%u largest=%u minHeap=%u psram=%u psramLargest=%u stackHW=%u | %s",
+           progressAge, phase, phaseAge,
+           renderDiagTileIndex, renderTilesTotal, renderDiagTileX, renderDiagTileY,
+           ESP.getFreeHeap(), largestInternalBlock(), ESP.getMinFreeHeap(),
+           ESP.getFreePsram(), largestPsramBlock(), renderStackHighWater(),
+           url[0] ? url : "<none>");
+}
+
+// ---------------------------------------------------------------------------
+// renderTaskFn — Core 1 task. Waits for notification, renders into the scratch
+// sprite, copies it into the target layer cache, then signals READY. It never
+// touches the display bus directly.
+// ---------------------------------------------------------------------------
+void renderTaskFn(void*) {
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    int completedLayer = renderLayerStyle;
+    DBG_INFO("RenderTask wake | core=%d | stackHW=%u | heap=%u largest=%u",
+             xPortGetCoreID(), renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
+    renderRadarMap();
+    setRenderDiagPhase("cache_copy");
+    renderScratch.pushSprite(layerCacheSprites[completedLayer], 0, 0);
+    markLayerCacheUpdated(completedLayer);
+    if (completedLayer == layerStyle) {
+      mapFront = layerCacheSprites[completedLayer];
+    }
+    renderState = RENDER_READY;
+    DBG_INFO("RenderTask ready | layer=%s cacheAge=%lus | stackHW=%u | heap=%u largest=%u",
+             layerNames[completedLayer], layerCacheAgeSecs(completedLayer),
+             renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -1251,37 +1648,99 @@ void setup() {
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(3);
   lcd.setTextDatum(middle_center);
-  lcd.drawString("Connecting to internet...", 400, 240);
+  lcd.drawString("Connecting...", 400, 240);
 
-  lcd.fillScreen(TFT_BLACK);
-  if (initWiFi()) {
-    lcd.setTextColor(TFT_GREEN);
-    lcd.drawString("Connected!", 400, 240);
-    configTzTime(NTP_TIMEZONE, ntpServer);
-  } else {
-    lcd.setTextColor(TFT_RED);
-    lcd.drawString("No Internet!", 400, 240);
+  bool wifiOk = initWiFi();
+  String ip = "";
+  if (wifiOk) {
+    configTzTime(cfg::kNtpTimezone, ntpServer);
+    ip = WiFi.localIP().toString();
   }
 
-  delay(1500);
-  lcd.fillScreen(TFT_BLACK);
+  renderScratch.setPsram(true);
+  cacheRadar.setPsram(true);
+  cacheClouds.setPsram(true);
+  cacheRain.setPsram(true);
+  if (!renderScratch.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("renderScratch alloc failed");
+  if (!cacheRadar.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("cacheRadar alloc failed");
+  if (!cacheClouds.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("cacheClouds alloc failed");
+  if (!cacheRain.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("cacheRain alloc failed");
+  DBG_INFO("Layer cache sprites allocated | PSRAM free=%u largest=%u",
+           ESP.getFreePsram(), largestPsramBlock());
 
-  mapCanvas.setPsram(true);
-  if (!mapCanvas.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) Serial.println("PSRAM Sprite failed!");
+  drawStartupScreen(wifiOk, WiFi.SSID().c_str(), ip.c_str());
 
   lastUpdate = millis();
   getWeatherData();
-  renderRadarMap();
-  drawTopDate();
-  drawBottomDashboard();
-  drawSideButtons();
-  drawSignature();
+
+  // Update startup screen status now that weather is done and map tiles are next.
+  lcd.setTextDatum(middle_center);
+  lcd.setTextColor(TFT_BLACK, TFT_BLACK);
+  lcd.setTextSize(3);
+  lcd.drawString("Loading map...", 400, 390);  // erase old text
+  lcd.setTextColor(TFT_CYAN);
+  lcd.drawString("Fetching map tiles...", 400, 390);
+
+  BaseType_t renderTaskOk = xTaskCreatePinnedToCore(
+    renderTaskFn,
+    "RenderTask",
+    cfg::kRenderTaskStackBytes,
+    nullptr,
+    cfg::kRenderTaskPriority,
+    &renderTaskHandle,
+    1);
+
+  if (renderTaskOk != pdPASS || renderTaskHandle == nullptr) {
+    DBG_ERROR("RenderTask create failed | rc=%d | heap=%u largest=%u",
+              (int)renderTaskOk, ESP.getFreeHeap(), largestInternalBlock());
+  } else {
+    DBG_INFO("RenderTask created | stack=%u priority=%u core=1 | heap=%u largest=%u",
+             (unsigned)cfg::kRenderTaskStackBytes,
+             (unsigned)cfg::kRenderTaskPriority,
+             ESP.getFreeHeap(), largestInternalBlock());
+  }
+
+  layerCycleLastMs = millis();
+  realtimeRefreshLastMs = millis();
+  lastUpdate = realtimeRefreshLastMs;
+  triggerRenderForLayer(layerStyle, false);
+
+  logStartupBanner(wifiOk, ip.c_str());
 }
 
 void loop() {
   static unsigned long lT = 0, lTouch = 0;
   struct tm ti;
 
+  // --- Flip completed background render to screen ---
+  if (renderState == RENDER_READY) {
+    renderState = RENDER_IDLE;
+    lcd.fillScreen(TFT_BLACK);
+    mapFront->pushSprite(0, 0);
+    drawMapBadges();
+    firstRenderDone = true;
+    drawTopDate();
+    drawBottomDashboard();
+    drawSideButtons();
+    drawSignature();
+    drawProgressTimer();
+    if (renderPending) {
+      int queuedLayer = pendingLayerStyle;
+      bool queuedForce = pendingRenderForce;
+      renderPending = false;
+      pendingRenderForce = false;
+      triggerRenderForLayer(queuedLayer, queuedForce);
+    }
+  }
+
+  if (!firstRenderDone) {
+    updateLoadingProgress();
+    pollRenderWatchdog();
+    delay(10);  // yield to RenderTask while the startup screen is waiting
+    return;
+  }
+
+  // --- Per-minute dashboard update ---
   if (appState == 0 && getLocalTime(&ti)) {
     if (ti.tm_min != lastMinute) {
       lastMinute = ti.tm_min;
@@ -1290,138 +1749,101 @@ void loop() {
     }
   }
 
+  // --- Progress timer every 5 s ---
   if (appState == 0 && millis() - lT > 5000) {
     drawProgressTimer();
     lT = millis();
   }
 
- if (touch_has_signal() && touch_touched()) {
-  int tx = touch_last_x, ty = touch_last_y;
-
-  // Brightness slider on left bar
-  if (appState == 0 && tx >= 0 && tx <= 32 && ty >= 4 && ty <= 413) {
-    setBrightnessFromTouchY(ty);
-    drawProgressTimer();
-    delay(25);
-    return;
+  // --- Layer auto-cycle ---
+  if (appState == 0 &&
+      millis() - layerCycleLastMs >= (unsigned long)cfg::kLayerCycleSecs * 1000UL) {
+    layerStyle = (layerStyle + 1) % 3;
+    if (layerStyle != 0 && (owmAuthFailed || strlen(owmApiKey) == 0)) layerStyle = 0;
+    layerCycleLastMs = millis();
+    DBG_INFO("Layer auto → %s", layerNames[layerStyle]);
+    drawMapBadges();
+    triggerRenderForLayer(layerStyle, false);
   }
+
+  // --- Touch ---
+  if (touch_has_signal() && touch_touched()) {
+    int tx = touch_last_x, ty = touch_last_y;
+
+    // Brightness slider (left bar)
+    if (appState == 0 && tx >= 0 && tx <= 32 && ty >= 4 && ty <= 413) {
+      setBrightnessFromTouchY(ty);
+      drawProgressTimer();
+      delay(25);
+      return;
+    }
 
     if (millis() - lTouch > 600) {
       if (appState == 0) {
+        // Layer toggle (top centre strip)
         if (ty > 0 && ty < 40 && tx > 300 && tx < 500) {
           layerStyle = (layerStyle + 1) % 3;
-
-          lcd.fillRect(250, 200, 300, 80, TFT_BLACK);
-          lcd.drawRect(250, 200, 300, 80, TFT_WHITE);
-          lcd.setTextColor(TFT_YELLOW);
-          lcd.setTextSize(3);
-          lcd.setTextDatum(middle_center);
-          lcd.drawString("Layer: " + String(layerNames[layerStyle]), 400, 240);
-          delay(800);
-
-          renderRadarMap();
-          drawTopDate();
-          drawBottomDashboard();
-          drawSideButtons();
-          drawSignature();
-          drawProgressTimer();
+          if (layerStyle != 0 && (owmAuthFailed || strlen(owmApiKey) == 0)) layerStyle = 0;
+          layerCycleLastMs = millis();
+          drawMapBadges();
+          triggerRenderForLayer(layerStyle, false);
         }
+        // Map style toggle (bottom centre strip)
         else if (tx > 310 && tx < 490 && ty > 385 && ty < 480) {
           mapStyle = (mapStyle + 1) % 3;
-
-          lcd.fillRect(250, 200, 300, 80, TFT_BLACK);
-          lcd.drawRect(250, 200, 300, 80, TFT_WHITE);
-          lcd.setTextColor(TFT_YELLOW);
-          lcd.setTextSize(3);
-          lcd.setTextDatum(middle_center);
-          lcd.drawString("Map: " + String(mapNames[mapStyle]), 400, 240);
-          delay(800);
-
-          renderRadarMap();
-          drawTopDate();
-          drawBottomDashboard();
-          drawSideButtons();
-          drawSignature();
+          invalidateLayerCaches();
+          layerCycleLastMs = millis();
+          drawMapBadges();
+          triggerRenderForLayer(layerStyle, true);
         }
-else if (tx > 760) {
-  if (ty > 50 && ty < 125) appState = 1, drawGraphPage(1);
-  else if (ty > 135 && ty < 210) appState = 2, drawGraphPage(2);
-  else if (ty > 220 && ty < 295) appState = 3, drawGraphPage(3);
-  else if (ty > 305 && ty < 380) appState = 4, drawGraphPage(4);
-}
-else if (tx > 32 && tx < 66) {
-  if (ty > 50 && ty < 125) appState = 5, drawGraphPage(5);
-  else if (ty > 135 && ty < 210) appState = 6, drawGraphPage(6);
-  else if (ty > 220 && ty < 295) appState = 7, drawGraphPage(7);
-  else if (ty > 305 && ty < 380) appState = 8, drawGraphPage(8);
-}
+        // Right side graph buttons
+        else if (tx > 760) {
+          if      (ty > 50  && ty < 125) appState = 1, drawGraphPage(1);
+          else if (ty > 135 && ty < 210) appState = 2, drawGraphPage(2);
+          else if (ty > 220 && ty < 295) appState = 3, drawGraphPage(3);
+          else if (ty > 305 && ty < 380) appState = 4, drawGraphPage(4);
+        }
+        // Left side graph buttons
+        else if (tx > 32 && tx < 66) {
+          if      (ty > 50  && ty < 125) appState = 5, drawGraphPage(5);
+          else if (ty > 135 && ty < 210) appState = 6, drawGraphPage(6);
+          else if (ty > 220 && ty < 295) appState = 7, drawGraphPage(7);
+          else if (ty > 305 && ty < 380) appState = 8, drawGraphPage(8);
+        }
+        // Zoom (centre map area)
         else if (tx > 250 && tx < 550 && ty > 100 && ty < 380) {
           myZoom++;
           if (myZoom > 7) myZoom = 5;
-
-          lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-          lcd.setTextSize(6);
-          lcd.setTextDatum(middle_center);
-          lcd.drawString("ZOOM: " + String(myZoom), 400, 240);
-          delay(800);
-
-          renderRadarMap();
-          drawTopDate();
-          drawBottomDashboard();
-          drawSideButtons();
-          drawSignature();
+          DBG_INFO("Zoom → %d", myZoom);
+          invalidateLayerCaches();
+          layerCycleLastMs = millis();
+          triggerRenderForLayer(layerStyle, true);
         }
-      } else if (tx < 150 && ty > 400) {
+      }
+      // Back from graph page
+      else if (tx < 150 && ty > 400) {
         appState = 0;
         lcd.fillScreen(TFT_BLACK);
-
-        if (mapCanvas.getBuffer() != nullptr) {
-          mapCanvas.pushSprite(0, 0);
-        } else {
-          renderRadarMap();
-        }
-
+        mapFront->pushSprite(0, 0);
+        drawMapBadges();
         drawBottomDashboard();
         drawSideButtons();
         drawSignature();
         drawTopDate();
-
-        int mapX = 740;
-        int mapY = 387;
-        int mapW = 60;
-        int mapH = 22;
-
-        lcd.fillRect(mapX, mapY, mapW, mapH, panelColor);
-        lcd.drawRect(mapX, mapY, mapW, mapH, TFT_WHITE);
-        lcd.setTextColor(TFT_WHITE);
-        lcd.setTextSize(1);
-        lcd.setTextDatum(middle_center);
-        lcd.drawString(mapNames[mapStyle], mapX + (mapW / 2), mapY + (mapH / 2));
-
-        int layerX = 360;
-        int layerY = 10;
-        int layerW = 70;
-        int layerH = 22;
-
-        lcd.fillRect(layerX, layerY, layerW, layerH, panelColor);
-        lcd.drawRect(layerX, layerY, layerW, layerH, TFT_WHITE);
-        lcd.setTextColor(TFT_WHITE);
-        lcd.setTextSize(1);
-        lcd.setTextDatum(middle_center);
-        lcd.drawString(layerNames[layerStyle], layerX + (layerW / 2), layerY + (layerH / 2));
       }
 
       lTouch = millis();
     }
   }
 
-  if (appState == 0 && millis() - lastUpdate > 600000) {
-    lastUpdate = millis();
+  // --- Realtime weather + map refresh ---
+  if (appState == 0 &&
+      millis() - realtimeRefreshLastMs > (unsigned long)cfg::kRealtimeRefreshSecs * 1000UL) {
+    realtimeRefreshLastMs = millis();
+    lastUpdate = realtimeRefreshLastMs;
+    DBG_INFO("Realtime refresh due | interval=%ds", cfg::kRealtimeRefreshSecs);
     getWeatherData();
-    renderRadarMap();
-    drawTopDate();
-    drawBottomDashboard();
-    drawSideButtons();
-    drawSignature();
+    invalidateLayerCaches();
+    triggerRenderForLayer(layerStyle, true);
   }
 }

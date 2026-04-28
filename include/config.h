@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-#define FW_VERSION "1.0.0"
+constexpr const char* kFwVersion = "1.3.0";
 
 namespace cfg {
 
@@ -15,6 +15,7 @@ constexpr int kScreenHeight = 480;
 // 3. kMapZoom controls the startup map zoom; 5-7 is the intended touch-cycle range.
 // 4. kDefaultMapStyle selects startup map base: 0 = dark, 1 = topo, 2 = OSM.
 // 5. The base-map contrast/brightness values tune tile visibility on the LCD.
+
 constexpr const char* kLocationName = "Putney, NSW, Australia";
 constexpr double kLocationLatitude  = -33.8261;
 constexpr double kLocationLongitude = 151.1063;
@@ -22,6 +23,15 @@ constexpr int kMapZoom = 6;
 constexpr int kDefaultMapStyle = 1;          // 0 = dark, 1 = topo, 2 = OSM
 constexpr int kBaseMapContrastPercent = 125; // 100 = unchanged
 constexpr int kBaseMapBrightness = 18;       // -255 to 255, applied after contrast
+
+constexpr const char* kWifiApName  = "ESP32S3-Weather";
+constexpr const char* kNtpTimezone = "AEST-10AEDT,M10.1.0,M4.1.0/3";
+constexpr int         kLayerCycleSecs = 30;
+constexpr int         kRealtimeRefreshSecs = 1800; // weather/map API refresh interval
+constexpr uint32_t    kRenderTaskStackBytes = 32768;
+constexpr UBaseType_t kRenderTaskPriority = 1;
+constexpr uint32_t    kRenderStallWarnMs = 10000;
+constexpr uint32_t    kRenderStallRepeatMs = 10000;
 
 constexpr int kPinD0  = 14;
 constexpr int kPinD1  = 38;
@@ -62,6 +72,3 @@ constexpr uint8_t CH422G_LCD_RST = 3;
 constexpr bool TOUCH_SWAP_XY  = false;
 constexpr bool TOUCH_INVERT_X = false;
 constexpr bool TOUCH_INVERT_Y = false;
-
-#define WIFI_AP_NAME "ESP32S3-Weather"
-#define NTP_TIMEZONE "AEST-10AEDT,M10.1.0,M4.1.0/3"

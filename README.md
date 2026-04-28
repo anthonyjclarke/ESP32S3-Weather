@@ -11,8 +11,7 @@ PlatformIO project targeting the Waveshare ESP32-S3-Touch-LCD-7 hardware stack.
 
 ## Hardware
 
-This build uses the Waveshare 7-inch ESP32-S3 RGB display configuration from the
-working `ESP32S3_7inch_Pong_Clock` project:
+This build uses the Waveshare 7-inch ESP32-S3 RGB display
 
 - 800x480 RGB panel
 - GT911 capacitive touch
@@ -99,6 +98,23 @@ valid key in `include/secrets.h`:
 
 If the serial monitor shows `OpenWeatherMap overlay unauthorized (401)`, the key
 is missing, not active yet, incorrect, or does not have Weather Maps access.
+
+## Realtime Refresh And Layer Cache
+
+RADAR, CLOUDS, and RAIN are rendered into separate PSRAM layer caches. Layer
+cycling uses those cached sprites instead of fetching fresh tiles on every
+change.
+
+The realtime refresh interval is configured in `include/config.h`:
+
+```cpp
+constexpr int kRealtimeRefreshSecs = 1800;
+```
+
+At the default value, weather data, RainViewer metadata, and map tiles are
+refreshed every 30 minutes. Cache misses, map-style changes, and zoom changes
+still trigger a render because the stored tile image no longer matches the
+requested view.
 
 ## Notes
 
