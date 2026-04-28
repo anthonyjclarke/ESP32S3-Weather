@@ -1,0 +1,9 @@
+.pio/
+secrets.h
+*.bin
+*.elf
+*.map
+node_modules/
+.DS_Store
+.vscode/c_cpp_properties.json
+.vscode/launch.json
