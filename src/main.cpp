@@ -16,6 +16,7 @@
 #include "debug.h"
 #include "display_hw.h"
 #include "secrets.h"
+#include "touch.h"
 #include "waveshare_display.h"
 
 const char* ntpServer = "pool.ntp.org";
@@ -91,14 +92,12 @@ char renderDiagUrl[180] = "";
 constexpr int kTileSize = 256;
 constexpr int kMapCanvasHeight = 415;
 
-// Weather variables mapping for ZLATEN section
 float currentTemp, morningTemp, noonTemp, eveningTemp;
 int morningCode, noonCode, eveningCode;
 float dMax[16], dMin[16], dRain[16], dPress[16], dCloud[16];
 float dHum[16], dWind[16], dUV[16], dSolar[16];
 int dCode[16];
 
-// Прототипи на функции
 void setBrightnessFromTouchY(int ty);
 void getWeatherData();
 void renderRadarMap();
@@ -115,7 +114,6 @@ int getDayOfMonthOffset(struct tm baseTime, int offsetDays);
 bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* httpStatus = nullptr);
 void updateLoadingProgress();
 
-#include "touch.h"
 PNG png;
 int globalX, globalY;
 uint16_t panelColor = 0x0841;
@@ -163,20 +161,17 @@ void drawRainDrops(int x, int y, uint16_t color, bool heavy) {
 }
 
 void drawSnowFlakes(int x, int y, uint16_t color, bool heavy) {
-  // left flake
   lcd.drawLine(x - 5, y + 7, x - 1, y + 11, color);
   lcd.drawLine(x - 1, y + 7, x - 5, y + 11, color);
   lcd.drawLine(x - 3, y + 6, x - 3, y + 12, color);
   lcd.drawLine(x - 6, y + 9, x, y + 9, color);
 
-  // right flake
   lcd.drawLine(x + 3, y + 7, x + 7, y + 11, color);
   lcd.drawLine(x + 7, y + 7, x + 3, y + 11, color);
   lcd.drawLine(x + 5, y + 6, x + 5, y + 12, color);
   lcd.drawLine(x + 2, y + 9, x + 8, y + 9, color);
 
   if (heavy) {
-    // center flake
     lcd.drawLine(x - 1, y + 10, x + 3, y + 14, color);
     lcd.drawLine(x + 3, y + 10, x - 1, y + 14, color);
     lcd.drawLine(x + 1, y + 9, x + 1, y + 15, color);
@@ -185,7 +180,6 @@ void drawSnowFlakes(int x, int y, uint16_t color, bool heavy) {
 }
 
 void drawMiniSnow(int x, int y, uint16_t color, bool heavy) {
-  // left flake
   lcd.drawLine(x - 3, y + 4, x - 1, y + 6, color);
   lcd.drawLine(x - 1, y + 4, x - 3, y + 6, color);
   lcd.drawPixel(x - 2, y + 3, color);
@@ -193,7 +187,6 @@ void drawMiniSnow(int x, int y, uint16_t color, bool heavy) {
   lcd.drawPixel(x - 4, y + 5, color);
   lcd.drawPixel(x,     y + 5, color);
 
-  // right flake
   lcd.drawLine(x + 2, y + 4, x + 4, y + 6, color);
   lcd.drawLine(x + 4, y + 4, x + 2, y + 6, color);
   lcd.drawPixel(x + 3, y + 3, color);
@@ -202,7 +195,6 @@ void drawMiniSnow(int x, int y, uint16_t color, bool heavy) {
   lcd.drawPixel(x + 5, y + 5, color);
 
   if (heavy) {
-    // small center flake
     lcd.drawPixel(x, y + 6, color);
     lcd.drawPixel(x, y + 5, color);
     lcd.drawPixel(x, y + 7, color);
@@ -490,10 +482,10 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     return false;
   }
 
-  // VAZHNO: bara nekopresiran odgovor
+  // Request uncompressed response — PNGdec needs raw bytes, not gzip.
   http.addHeader("Accept-Encoding", "identity");
   http.addHeader("User-Agent", "ESP32-WeatherDisplay/1.0");
-  http.useHTTP10(true);   // pomaga kaj nekoi tile serveri
+  http.useHTTP10(true);   // disables chunked transfer-encoding; some tile servers require it
 	
   setRenderDiagPhase("http_get");
   int code = http.GET();
@@ -514,7 +506,7 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
 
   WiFiClient* stream = http.getStreamPtr();
 
-  // Ako nema content-length, citaj stream rachno
+  // No Content-Length: read stream manually until connection closes or timeout.
   if (len <= 0) {
     setRenderDiagPhase("http_read_chunked");
     const size_t maxChunkedSize = 100000;
@@ -628,7 +620,7 @@ void setBrightnessFromTouchY(int ty) {
   if (ty < by) ty = by;
   if (ty > by + bh) ty = by + bh;
 
-  // gore = poslabo, dolu = pojako
+  // top of bar = dim, bottom = bright
   brightnessLevel = map(ty, by, by + bh, 255, 20);
 
   if (brightnessLevel < 20) brightnessLevel = 20;

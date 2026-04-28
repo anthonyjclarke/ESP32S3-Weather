@@ -11,7 +11,7 @@ PlatformIO project targeting the Waveshare ESP32-S3-Touch-LCD-7 hardware stack.
 
 ## Hardware
 
-This build uses the Waveshare 7-inch ESP32-S3 RGB display
+This build uses the Waveshare 7-inch ESP32-S3 RGB display - https://docs.waveshare.com/ESP32-S3-Touch-LCD-7
 
 - 800x480 RGB panel
 - GT911 capacitive touch
@@ -105,6 +105,14 @@ RADAR, CLOUDS, and RAIN are rendered into separate PSRAM layer caches. Layer
 cycling uses those cached sprites instead of fetching fresh tiles on every
 change.
 
+The render path has two sprite roles:
+
+- `renderScratch` is the background render target. Network tile fetches and PNG
+  decoding happen there while the current map remains on screen.
+- `cacheRadar`, `cacheClouds`, and `cacheRain` store the completed layer images.
+  Once a render completes, the scratch sprite is copied into the relevant cache
+  and that cached sprite becomes the front buffer for display.
+
 The realtime refresh interval is configured in `include/config.h`:
 
 ```cpp
@@ -116,8 +124,30 @@ refreshed every 30 minutes. Cache misses, map-style changes, and zoom changes
 still trigger a render because the stored tile image no longer matches the
 requested view.
 
+A serial log like this is expected during normal layer cycling:
+
+```text
+[INFO]  Layer cache hit | layer=CLOUDS age=401s | zoom=6 map=TOPO
+```
+
+It means the CLOUDS layer was already rendered for the current zoom level and
+base map style, and the cached image is still inside the refresh window. In this
+example the cached image is 401 seconds old, so the firmware reuses it instead
+of downloading and rendering the OpenWeatherMap cloud tiles again.
+
+A fresh cache hit avoids network/API traffic and keeps layer changes responsive.
+A new render is scheduled only when the cache is missing, stale, explicitly
+forced, or no longer matches the active map style or zoom.
+
 ## Notes
 
 The Waveshare board backlight is controlled through the CH422G expander as a
-digital enable, matching the Pong Clock project. The on-screen brightness slider
-therefore behaves as an on/off backlight control on this hardware.
+digital enable. The on-screen brightness slider therefore behaves as an on/off
+backlight control on this hardware.
+
+## Reference Docs
+
+- [Original source code](docs/weather_dashboard_original_code.c) — Mirko
+  Pavleski's reference implementation, preserved for comparison.
+- [Functional description](docs/weather_dashboard_functional_description.md) —
+  overview of dashboard behaviour, data sources, and UI interactions.

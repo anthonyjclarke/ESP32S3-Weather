@@ -102,6 +102,9 @@ cfg::kNtpTimezone           // POSIX tz string
 cfg::kLayerCycleSecs        // UI layer auto-cycle interval
 cfg::kRealtimeRefreshSecs   // weather/map API refresh interval
 cfg::kRenderTaskStackBytes  // FreeRTOS render task stack size
+cfg::kRenderTaskPriority    // FreeRTOS render task priority (default 1)
+cfg::kRenderStallWarnMs     // ms before stall warning is logged (default 10 000)
+cfg::kRenderStallRepeatMs   // ms between repeated stall warnings (default 10 000)
 ```
 
 ## Debug Levels
