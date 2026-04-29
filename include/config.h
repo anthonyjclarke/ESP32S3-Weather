@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-constexpr const char* kFwVersion = "1.3.0";
+constexpr const char* kFwVersion = "1.3.1";
 
 namespace cfg {
 
@@ -19,12 +19,13 @@ constexpr int kScreenHeight = 480;
 constexpr const char* kLocationName = "Putney, NSW, Australia";
 constexpr double kLocationLatitude  = -33.8261;
 constexpr double kLocationLongitude = 151.1063;
-constexpr int kMapZoom = 6;
+constexpr int kMapZoom = 5;
 constexpr int kDefaultMapStyle = 1;          // 0 = dark, 1 = topo, 2 = OSM
 constexpr int kBaseMapContrastPercent = 125; // 100 = unchanged
 constexpr int kBaseMapBrightness = 18;       // -255 to 255, applied after contrast
 
 constexpr const char* kWifiApName  = "ESP32S3-Weather";
+constexpr const char* kOtaHostname = "ESP32S3-Weather";
 constexpr const char* kNtpTimezone = "AEST-10AEDT,M10.1.0,M4.1.0/3";
 constexpr int         kLayerCycleSecs = 30;
 constexpr int         kRealtimeRefreshSecs = 1800; // weather/map API refresh interval

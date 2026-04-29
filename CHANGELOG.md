@@ -3,7 +3,30 @@
 ## Todo
 - Stop screen Glitching
 - Implement WebUI with configuration and replica of TFT
-- Add OTA
+- Indicator on TFT on date of last update on Layer
+- Visual Indicator if downloading in background updated layers
+- Simplify the logs when Fetching Data
+- Evaluate base-map cache separation in `ENHANCEMENTS.md` to improve tile render
+  speed.
+
+## [1.3.1] 2026-04-29
+
+### Fixed
+
+- Touch unresponsive during weather data refresh. `getWeatherData()` made two
+  blocking HTTPS calls (Open-Meteo + RainViewer) directly in `loop()` on
+  Core 0, freezing the touchscreen for up to 40 s every
+  `kRealtimeRefreshSecs` interval.
+- All network I/O now runs on Core 1. `loop()` sets `weatherRefreshPending`
+  instead of calling `getWeatherData()` directly. `renderTaskFn` checks the
+  flag on wake, fetches weather data before rendering, then clears it.
+  Core 0 stays fully responsive throughout.
+
+### Added (OTA)
+
+- ArduinoOTA support using the `esp32s3-7inch-ota` PlatformIO environment.
+
+---
 
 ## [1.3.0] 2026-04-28
 

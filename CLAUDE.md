@@ -63,10 +63,13 @@ Core 1 background render with retained per-layer caches:
 | `renderTarget` | What PNG draw callbacks write to during a render (`renderScratch`) |
 | `renderState` | `RENDER_IDLE` → `RENDER_BUSY` (Core 1) → `RENDER_READY` → `RENDER_IDLE` (Core 0 flip) |
 | `renderPending` | Set when a new render is requested while one is already BUSY; re-triggers after flip |
+| `weatherRefreshPending` | Set by Core 0 when a realtime refresh is due; Core 1 calls `getWeatherData()` before rendering then clears it |
 | `triggerRenderForLayer()` | Core 0 entry point — serves fresh cache immediately or schedules a network render |
-| `renderTaskFn` | FreeRTOS task on Core 1: waits → renders scratch → copies to layer cache → sets READY |
+| `renderTaskFn` | FreeRTOS task on Core 1: waits → fetches weather if `weatherRefreshPending` → renders scratch → copies to layer cache → sets READY |
 
 **Rule:** `lcd.` (display bus) calls only from Core 0. Core 1 writes to PSRAM sprite only.
+
+**Rule:** All HTTP fetches (weather data and map tiles) happen on Core 1. Core 0 never blocks on network I/O after startup, keeping the touchscreen responsive throughout.
 
 Layer auto-cycle interval is `cfg::kLayerCycleSecs` (default 30 s, set in `include/config.h`). Touch on the layer badge resets the timer. OWM layers auto-skipped if key absent or 401 received.
 

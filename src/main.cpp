@@ -6,6 +6,7 @@
 #include <WiFiManager.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <PNGdec.h>
 #include <esp_heap_caps.h>
@@ -18,6 +19,10 @@
 #include "secrets.h"
 #include "touch.h"
 #include "waveshare_display.h"
+
+#ifndef SECRET_OTA_PASSWORD
+#define SECRET_OTA_PASSWORD "change-me"
+#endif
 
 const char* ntpServer = "pool.ntp.org";
 
@@ -34,6 +39,7 @@ int brightnessLevel = 100;
 int mapStyle = cfg::kDefaultMapStyle;   // 0 = dark_all, 1 = opentopomap, 2 = openstreetmap
 int layerStyle = 0; // 0 = Radar, 1 = Clouds, 2 = Rain
 bool owmAuthFailed = false;
+bool otaInProgress = false;
 
 String radarHost = "https://tilecache.rainviewer.com";
 String radarPath = "";
@@ -69,7 +75,8 @@ LayerCacheState layerCaches[3] = {};
 
 enum RenderState : uint8_t { RENDER_IDLE, RENDER_BUSY, RENDER_READY };
 volatile RenderState renderState = RENDER_IDLE;
-volatile bool renderPending  = false;
+volatile bool renderPending        = false;
+volatile bool weatherRefreshPending = false;
 bool          firstRenderDone = false;
 unsigned long layerCycleLastMs = 0;
 unsigned long realtimeRefreshLastMs = 0;
@@ -453,6 +460,78 @@ unsigned long layerCacheAgeSecs(int targetLayer) {
   return (millis() - layerCaches[targetLayer].updatedMs) / 1000UL;
 }
 
+bool layerRenderInProgress(int targetLayer) {
+  return renderState == RENDER_BUSY && renderLayerStyle == targetLayer;
+}
+
+void formatLayerAgeLabel(int targetLayer, char* out, size_t outLen) {
+  if (outLen == 0) return;
+
+  if (targetLayer < 0 || targetLayer > 2) {
+    strlcpy(out, "--", outLen);
+    return;
+  }
+
+  if (layerCacheMatches(targetLayer)) {
+    unsigned long ageSecs = layerCacheAgeSecs(targetLayer);
+    if (ageSecs < 60) {
+      strlcpy(out, "fresh", outLen);
+    } else if (ageSecs < 3600) {
+      snprintf(out, outLen, "%lum old", ageSecs / 60UL);
+    } else if (ageSecs < 86400) {
+      snprintf(out, outLen, "%luh %lum", ageSecs / 3600UL, (ageSecs % 3600UL) / 60UL);
+    } else {
+      snprintf(out, outLen, "%lud old", ageSecs / 86400UL);
+    }
+    return;
+  }
+
+  if (layerRenderInProgress(targetLayer)) {
+    strlcpy(out, "updating", outLen);
+    return;
+  }
+
+  if (renderPending && pendingLayerStyle == targetLayer) {
+    strlcpy(out, "queued", outLen);
+    return;
+  }
+
+  strlcpy(out, "no cache", outLen);
+}
+
+uint16_t layerAgeColor(int targetLayer) {
+  if (targetLayer < 0 || targetLayer > 2) return TFT_DARKGREY;
+  if (layerCacheMatches(targetLayer)) {
+    unsigned long ageSecs = layerCacheAgeSecs(targetLayer);
+    unsigned long refreshSecs = (unsigned long)cfg::kRealtimeRefreshSecs;
+    if (ageSecs >= refreshSecs) return TFT_RED;
+    if (ageSecs >= (refreshSecs * 3UL) / 4UL) return TFT_YELLOW;
+    if (ageSecs < 60) return TFT_GREEN;
+    return TFT_LIGHTGREY;
+  }
+
+  if (layerRenderInProgress(targetLayer) || (renderPending && pendingLayerStyle == targetLayer)) return TFT_YELLOW;
+  return TFT_DARKGREY;
+}
+
+void logRenderProgressSummary(int targetLayer, int tilesOk, int tilesErr, unsigned long renderStart) {
+#if DEBUG_LEVEL == 3
+  const int done = renderTilesDone;
+  const int total = renderTilesTotal;
+  if (total <= 0) return;
+  if (done >= total || (done % 4) != 0) return;
+
+  DBG_INFO("Map render progress | layer=%s %d/%d tiles | ok=%d err=%d | %lums",
+           layerNames[targetLayer], done, total, tilesOk, tilesErr,
+           millis() - renderStart);
+#else
+  (void)targetLayer;
+  (void)tilesOk;
+  (void)tilesErr;
+  (void)renderStart;
+#endif
+}
+
 bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* httpStatus) {
   *outBuf = nullptr;
   *outLen = 0;
@@ -460,10 +539,10 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
 
   unsigned long fetchStart = millis();
   String safeUrl = redactUrlForLog(url);
-  DBG_INFO("Fetch start | tile=%d/%d | phase=%s | heap=%u largest=%u psram=%u stackHW=%u | %s",
-           renderDiagTileIndex, renderTilesTotal, renderDiagPhase,
-           ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
-           renderStackHighWater(), safeUrl.c_str());
+  DBG_VERBOSE("Fetch start | tile=%d/%d | phase=%s | heap=%u largest=%u psram=%u stackHW=%u | %s",
+              renderDiagTileIndex, renderTilesTotal, renderDiagPhase,
+              ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
+              renderStackHighWater(), safeUrl.c_str());
 
   // Explicit client with stream timeout so TLS handshake can't hang indefinitely.
   // http.begin(url) creates an internal client with no timeout — fatal when heap is fragmented.
@@ -496,13 +575,15 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     return false;
   }
 
-  String ctype = http.header("Content-Type");
-  String cenc  = http.header("Content-Encoding");
   int len = http.getSize();
 
-  DBG_INFO("HTTP 200 | tile=%d/%d | get=%lums | type=%s | enc=%s | len=%d",
-           renderDiagTileIndex, renderTilesTotal, millis() - fetchStart,
-           ctype.c_str(), cenc.c_str(), len);
+#if DEBUG_LEVEL >= 4
+  String ctype = http.header("Content-Type");
+  String cenc  = http.header("Content-Encoding");
+  DBG_VERBOSE("HTTP 200 | tile=%d/%d | get=%lums | type=%s | enc=%s | len=%d",
+              renderDiagTileIndex, renderTilesTotal, millis() - fetchStart,
+              ctype.c_str(), cenc.c_str(), len);
+#endif
 
   WiFiClient* stream = http.getStreamPtr();
 
@@ -545,10 +626,10 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     *outLen = total;
     http.end();
     setRenderDiagPhase("fetch_done");
-    DBG_INFO("Fetch done | tile=%d/%d | bytes=%u | %lums | heap=%u largest=%u stackHW=%u",
-             renderDiagTileIndex, renderTilesTotal, (unsigned)total,
-             millis() - fetchStart, ESP.getFreeHeap(), largestInternalBlock(),
-             renderStackHighWater());
+    DBG_VERBOSE("Fetch done | tile=%d/%d | bytes=%u | %lums | heap=%u largest=%u stackHW=%u",
+                renderDiagTileIndex, renderTilesTotal, (unsigned)total,
+                millis() - fetchStart, ESP.getFreeHeap(), largestInternalBlock(),
+                renderStackHighWater());
     return true;
   }
 
@@ -572,10 +653,10 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
   *outBuf = buf;
   *outLen = len;
   setRenderDiagPhase("fetch_done");
-  DBG_INFO("Fetch done | tile=%d/%d | bytes=%u | %lums | heap=%u largest=%u stackHW=%u",
-           renderDiagTileIndex, renderTilesTotal, (unsigned)len,
-           millis() - fetchStart, ESP.getFreeHeap(), largestInternalBlock(),
-           renderStackHighWater());
+  DBG_VERBOSE("Fetch done | tile=%d/%d | bytes=%u | %lums | heap=%u largest=%u stackHW=%u",
+              renderDiagTileIndex, renderTilesTotal, (unsigned)len,
+              millis() - fetchStart, ESP.getFreeHeap(), largestInternalBlock(),
+              renderStackHighWater());
   return true;
 }
 
@@ -604,10 +685,11 @@ void drawSignature() {
   }
 
   int sx = rx + rw + 5;
-  lcd.fillRect(sx, ry, 100, rh, panelColor);
-  lcd.drawRect(sx, ry, 100, rh, TFT_WHITE);
+  int sw = 220;
+  lcd.fillRect(sx, ry, sw, rh, panelColor);
+  lcd.drawRect(sx, ry, sw, rh, TFT_WHITE);
   lcd.setTextDatum(middle_center);
-  lcd.drawString("by mircemk", sx + 50, ry + 11);
+  lcd.drawString("by mircemk & anthonyjclarke", sx + sw / 2, ry + 11);
 
   lcd.fillRect(35, 388, 80, 22, panelColor);
   lcd.drawRect(35, 388, 80, 22, TFT_WHITE);
@@ -641,6 +723,85 @@ static bool initWiFi() {
   }
 
   return wm.autoConnect(cfg::kWifiApName);
+}
+
+void drawOtaStatus(const char* line1, const char* line2, int percent = -1) {
+  if (appState != 0) return;
+
+  int x = 260, y = 185, w = 280, h = 110;
+  lcd.fillRect(x, y, w, h, panelColor);
+  lcd.drawRect(x, y, w, h, TFT_WHITE);
+  lcd.setTextDatum(middle_center);
+  lcd.setTextSize(2);
+  lcd.setTextColor(TFT_CYAN);
+  lcd.drawString(line1, x + w / 2, y + 28);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString(line2, x + w / 2, y + 55);
+
+  if (percent >= 0) {
+    int barX = x + 24, barY = y + 78, barW = w - 48, barH = 14;
+    int fillW = (barW - 2) * percent / 100;
+    lcd.drawRect(barX, barY, barW, barH, TFT_WHITE);
+    lcd.fillRect(barX + 1, barY + 1, fillW, barH - 2, TFT_GREEN);
+    if (fillW < barW - 2) {
+      lcd.fillRect(barX + 1 + fillW, barY + 1, (barW - 2) - fillW, barH - 2, TFT_BLACK);
+    }
+  }
+}
+
+void setupOta(bool wifiOk) {
+  if (!wifiOk) {
+    DBG_WARN("OTA disabled: WiFi is not connected");
+    return;
+  }
+
+  ArduinoOTA.setHostname(cfg::kOtaHostname);
+  if (strlen(SECRET_OTA_PASSWORD) > 0) {
+    ArduinoOTA.setPassword(SECRET_OTA_PASSWORD);
+  }
+
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    const char* target = ArduinoOTA.getCommand() == U_FLASH ? "firmware" : "filesystem";
+    DBG_INFO("OTA start | target=%s", target);
+    drawOtaStatus("OTA Update", "Receiving firmware...", 0);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    otaInProgress = false;
+    DBG_INFO("OTA complete; rebooting");
+    drawOtaStatus("OTA Complete", "Rebooting...", 100);
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static int lastPercent = -1;
+    if (total == 0) return;
+    int percent = (progress * 100U) / total;
+    if (percent == lastPercent) return;
+    lastPercent = percent;
+    drawOtaStatus("OTA Update", "Receiving firmware...", percent);
+    if ((percent % 10) == 0) {
+      DBG_INFO("OTA progress | %d%%", percent);
+    }
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    const char* reason = "unknown";
+    if (error == OTA_AUTH_ERROR) reason = "auth";
+    else if (error == OTA_BEGIN_ERROR) reason = "begin";
+    else if (error == OTA_CONNECT_ERROR) reason = "connect";
+    else if (error == OTA_RECEIVE_ERROR) reason = "receive";
+    else if (error == OTA_END_ERROR) reason = "end";
+
+    DBG_ERROR("OTA failed | error=%u reason=%s", (unsigned)error, reason);
+    drawOtaStatus("OTA Failed", reason);
+  });
+
+  ArduinoOTA.begin();
+  DBG_INFO("OTA ready | host=%s.local | auth=%s",
+           cfg::kOtaHostname, strlen(SECRET_OTA_PASSWORD) > 0 ? "enabled" : "disabled");
 }
 
 void drawProgressTimer() {
@@ -1159,11 +1320,16 @@ void renderRadarMap() {
   renderTilesTotal = (endTX - startTX + 1) * (endTY - startTY + 1);
   renderDiagLastProgressMs = millis();
   setRenderDiagPhase("render_start");
-  DBG_INFO("Map render start | layer=%s zoom=%d map=%s | %d tiles | x=%d..%d y=%d..%d | heap=%u largest=%u psram=%u psramLargest=%u stackHW=%u",
-           layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], renderTilesTotal,
-           startTX, endTX, startTY, endTY,
-           ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
-           largestPsramBlock(), renderStackHighWater());
+#if DEBUG_LEVEL >= 4
+  DBG_VERBOSE("Map render start | layer=%s zoom=%d map=%s | %d tiles | x=%d..%d y=%d..%d | heap=%u largest=%u psram=%u psramLargest=%u stackHW=%u",
+              layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], renderTilesTotal,
+              startTX, endTX, startTY, endTY,
+              ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
+              largestPsramBlock(), renderStackHighWater());
+#else
+  DBG_INFO("Map render start | layer=%s zoom=%d map=%s | %d tiles",
+           layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], renderTilesTotal);
+#endif
   bool skipOwmOverlay = false;
 
   if (targetLayer != 0) {
@@ -1201,19 +1367,23 @@ void renderRadarMap() {
 
       int tileIndex = renderTilesDone + 1;
       setRenderDiagContext("base_fetch", tileIndex, wrappedTileX, tileY, mU);
-      DBG_INFO("Tile %d/%d base start | layer=%s z=%d x=%d y=%d | screen=%d,%d | heap=%u largest=%u",
-               tileIndex, renderTilesTotal, layerNames[targetLayer], targetZoom, wrappedTileX, tileY,
-               globalX, globalY, ESP.getFreeHeap(), largestInternalBlock());
+      DBG_VERBOSE("Tile %d/%d base start | layer=%s z=%d x=%d y=%d | screen=%d,%d | heap=%u largest=%u",
+                  tileIndex, renderTilesTotal, layerNames[targetLayer], targetZoom, wrappedTileX, tileY,
+                  globalX, globalY, ESP.getFreeHeap(), largestInternalBlock());
 
       if (fetchPngToBuffer(mU, &baseBuf, &baseLen)) {
         setRenderDiagPhase("base_decode");
+#if DEBUG_LEVEL >= 4
         unsigned long decodeStart = millis();
+#endif
         if (png.openRAM(baseBuf, baseLen, pngDrawCanvas) == PNG_SUCCESS) {
           png.decode(NULL, 0);
           png.close();
           tilesOk++;
-          DBG_INFO("Tile %d/%d base decoded | bytes=%u | %lums",
-                   tileIndex, renderTilesTotal, (unsigned)baseLen, millis() - decodeStart);
+#if DEBUG_LEVEL >= 4
+          DBG_VERBOSE("Tile %d/%d base decoded | bytes=%u | %lums",
+                      tileIndex, renderTilesTotal, (unsigned)baseLen, millis() - decodeStart);
+#endif
         } else {
           DBG_WARN("Base PNG open failed: %s", mU.c_str());
           tilesErr++;
@@ -1248,9 +1418,9 @@ if (targetLayer == 0) {
 
     String safeLayerUrl = redactUrlForLog(layerUrl);
     setRenderDiagContext("overlay_fetch", tileIndex, wrappedTileX, tileY, layerUrl);
-    DBG_INFO("Tile %d/%d overlay start | layer=%s | heap=%u largest=%u | %s",
-             tileIndex, renderTilesTotal, layerNames[targetLayer],
-             ESP.getFreeHeap(), largestInternalBlock(), safeLayerUrl.c_str());
+    DBG_VERBOSE("Tile %d/%d overlay start | layer=%s | heap=%u largest=%u | %s",
+                tileIndex, renderTilesTotal, layerNames[targetLayer],
+                ESP.getFreeHeap(), largestInternalBlock(), safeLayerUrl.c_str());
 
     int overlayStatus = 0;
 	  if (fetchPngToBuffer(layerUrl, &overlayBuf, &overlayLen, &overlayStatus)) {
@@ -1286,7 +1456,9 @@ if (targetLayer == 0) {
       free(overlayBuf);
     } else {
       setRenderDiagPhase("overlay_decode");
+#if DEBUG_LEVEL >= 4
       unsigned long decodeStart = millis();
+#endif
       int rc = png.openRAM(overlayBuf, overlayLen, pngDrawOverlayCanvas);
       if (rc == PNG_SUCCESS) {
         int decRc = png.decode(NULL, 0);
@@ -1294,8 +1466,10 @@ if (targetLayer == 0) {
           DBG_WARN("PNG decode failed rc=%d", decRc);
         }
         png.close();
-        DBG_INFO("Tile %d/%d overlay decoded | bytes=%u | %lums",
-                 tileIndex, renderTilesTotal, (unsigned)overlayLen, millis() - decodeStart);
+#if DEBUG_LEVEL >= 4
+        DBG_VERBOSE("Tile %d/%d overlay decoded | bytes=%u | %lums",
+                    tileIndex, renderTilesTotal, (unsigned)overlayLen, millis() - decodeStart);
+#endif
       } else {
         DBG_WARN("Overlay PNG open failed rc=%d", rc);
       }
@@ -1314,19 +1488,26 @@ if (targetLayer == 0) {
 
       renderTilesDone += 1;
       renderDiagLastProgressMs = millis();
-      DBG_INFO("Tile %d/%d done | ok=%d err=%d | heap=%u largest=%u psram=%u stackHW=%u",
-               renderTilesDone, renderTilesTotal, tilesOk, tilesErr,
-               ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
-               renderStackHighWater());
+      DBG_VERBOSE("Tile %d/%d done | ok=%d err=%d | heap=%u largest=%u psram=%u stackHW=%u",
+                  renderTilesDone, renderTilesTotal, tilesOk, tilesErr,
+                  ESP.getFreeHeap(), largestInternalBlock(), ESP.getFreePsram(),
+                  renderStackHighWater());
+      logRenderProgressSummary(targetLayer, tilesOk, tilesErr, renderStart);
       delay(50);  // yield between tiles — lets FreeRTOS process deferred heap cleanup
     }
   }
 
   setRenderDiagPhase("marker");
   drawLocationMarker();
-  DBG_INFO("Map render | layer=%s zoom=%d map=%s | %d ok %d err | %lums | heap=%u",
+#if DEBUG_LEVEL >= 4
+  DBG_VERBOSE("Map render done | layer=%s zoom=%d map=%s | %d ok %d err | %lums | heap=%u",
+              layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], tilesOk, tilesErr,
+              millis() - renderStart, ESP.getFreeHeap());
+#else
+  DBG_INFO("Map render done | layer=%s zoom=%d map=%s | %d ok %d err | %lums",
            layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], tilesOk, tilesErr,
-           millis() - renderStart, ESP.getFreeHeap());
+           millis() - renderStart);
+#endif
   clearRenderDiag();
 }
 
@@ -1398,13 +1579,18 @@ void drawMapBadges() {
   lcd.setTextDatum(middle_center);
   lcd.drawString(mapNames[mapStyle], mapX + mapW / 2, mapY + mapH / 2);
 
-  int layerX = 360, layerY = 10, layerW = 70, layerH = 22;
+  int layerX = 348, layerY = 4, layerW = 104, layerH = 40;
   lcd.fillRect(layerX, layerY, layerW, layerH, panelColor);
   lcd.drawRect(layerX, layerY, layerW, layerH, TFT_WHITE);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(1);
   lcd.setTextDatum(middle_center);
-  lcd.drawString(layerNames[layerStyle], layerX + layerW / 2, layerY + layerH / 2);
+  lcd.drawString(layerNames[layerStyle], layerX + layerW / 2, layerY + 12);
+
+  char ageLabel[16];
+  formatLayerAgeLabel(layerStyle, ageLabel, sizeof(ageLabel));
+  lcd.setTextColor(layerAgeColor(layerStyle));
+  lcd.drawString(ageLabel, layerX + layerW / 2, layerY + 28);
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,11 +1641,16 @@ void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
   renderMapStyle = mapStyle;
   renderZoom = myZoom;
   renderState = RENDER_BUSY;
-  DBG_INFO("Render scheduled | layer=%s force=%d cacheValid=%d cacheAge=%lus refresh=%ds",
-           layerNames[targetLayer], forceRefresh ? 1 : 0,
-           layerCaches[targetLayer].valid ? 1 : 0,
-           layerCacheAgeSecs(targetLayer),
-           cfg::kRealtimeRefreshSecs);
+#if DEBUG_LEVEL >= 4
+  DBG_VERBOSE("Render scheduled | layer=%s force=%d cacheValid=%d cacheAge=%lus refresh=%ds",
+              layerNames[targetLayer], forceRefresh ? 1 : 0,
+              layerCaches[targetLayer].valid ? 1 : 0,
+              layerCacheAgeSecs(targetLayer),
+              cfg::kRealtimeRefreshSecs);
+#else
+  DBG_INFO("Render scheduled | layer=%s force=%d",
+           layerNames[targetLayer], forceRefresh ? 1 : 0);
+#endif
   xTaskNotifyGive(renderTaskHandle);
 }
 
@@ -1606,9 +1797,13 @@ void pollRenderWatchdog() {
 void renderTaskFn(void*) {
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (weatherRefreshPending) {
+      weatherRefreshPending = false;
+      getWeatherData();
+    }
     int completedLayer = renderLayerStyle;
-    DBG_INFO("RenderTask wake | core=%d | stackHW=%u | heap=%u largest=%u",
-             xPortGetCoreID(), renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
+    DBG_VERBOSE("RenderTask wake | core=%d | stackHW=%u | heap=%u largest=%u",
+                xPortGetCoreID(), renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
     renderRadarMap();
     setRenderDiagPhase("cache_copy");
     renderScratch.pushSprite(layerCacheSprites[completedLayer], 0, 0);
@@ -1617,9 +1812,14 @@ void renderTaskFn(void*) {
       mapFront = layerCacheSprites[completedLayer];
     }
     renderState = RENDER_READY;
-    DBG_INFO("RenderTask ready | layer=%s cacheAge=%lus | stackHW=%u | heap=%u largest=%u",
-             layerNames[completedLayer], layerCacheAgeSecs(completedLayer),
-             renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
+#if DEBUG_LEVEL >= 4
+    DBG_VERBOSE("RenderTask ready | layer=%s cacheAge=%lus | stackHW=%u | heap=%u largest=%u",
+                layerNames[completedLayer], layerCacheAgeSecs(completedLayer),
+                renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
+#else
+    DBG_INFO("Render ready | layer=%s cacheAge=%lus",
+             layerNames[completedLayer], layerCacheAgeSecs(completedLayer));
+#endif
   }
 }
 
@@ -1648,6 +1848,7 @@ void setup() {
     configTzTime(cfg::kNtpTimezone, ntpServer);
     ip = WiFi.localIP().toString();
   }
+  setupOta(wifiOk);
 
   renderScratch.setPsram(true);
   cacheRadar.setPsram(true);
@@ -1704,6 +1905,14 @@ void loop() {
   static unsigned long lT = 0, lTouch = 0;
   struct tm ti;
 
+  if (WiFi.isConnected()) {
+    ArduinoOTA.handle();
+  }
+  if (otaInProgress) {
+    delay(1);
+    return;
+  }
+
   // --- Flip completed background render to screen ---
   if (renderState == RENDER_READY) {
     renderState = RENDER_IDLE;
@@ -1744,6 +1953,7 @@ void loop() {
   // --- Progress timer every 5 s ---
   if (appState == 0 && millis() - lT > 5000) {
     drawProgressTimer();
+    drawMapBadges();
     lT = millis();
   }
 
@@ -1754,8 +1964,8 @@ void loop() {
     if (layerStyle != 0 && (owmAuthFailed || strlen(owmApiKey) == 0)) layerStyle = 0;
     layerCycleLastMs = millis();
     DBG_INFO("Layer auto → %s", layerNames[layerStyle]);
-    drawMapBadges();
     triggerRenderForLayer(layerStyle, false);
+    drawMapBadges();
   }
 
   // --- Touch ---
@@ -1777,16 +1987,16 @@ void loop() {
           layerStyle = (layerStyle + 1) % 3;
           if (layerStyle != 0 && (owmAuthFailed || strlen(owmApiKey) == 0)) layerStyle = 0;
           layerCycleLastMs = millis();
-          drawMapBadges();
           triggerRenderForLayer(layerStyle, false);
+          drawMapBadges();
         }
         // Map style toggle (bottom centre strip)
         else if (tx > 310 && tx < 490 && ty > 385 && ty < 480) {
           mapStyle = (mapStyle + 1) % 3;
           invalidateLayerCaches();
           layerCycleLastMs = millis();
-          drawMapBadges();
           triggerRenderForLayer(layerStyle, true);
+          drawMapBadges();
         }
         // Right side graph buttons
         else if (tx > 760) {
@@ -1810,6 +2020,7 @@ void loop() {
           invalidateLayerCaches();
           layerCycleLastMs = millis();
           triggerRenderForLayer(layerStyle, true);
+          drawMapBadges();
         }
       }
       // Back from graph page
@@ -1833,9 +2044,10 @@ void loop() {
       millis() - realtimeRefreshLastMs > (unsigned long)cfg::kRealtimeRefreshSecs * 1000UL) {
     realtimeRefreshLastMs = millis();
     lastUpdate = realtimeRefreshLastMs;
-    DBG_INFO("Realtime refresh due | interval=%ds", cfg::kRealtimeRefreshSecs);
-    getWeatherData();
-    invalidateLayerCaches();
+    DBG_INFO("Realtime refresh due | interval=%ds | scheduling weather+render on Core 1",
+             cfg::kRealtimeRefreshSecs);
+    weatherRefreshPending = true;
     triggerRenderForLayer(layerStyle, true);
+    drawMapBadges();
   }
 }
