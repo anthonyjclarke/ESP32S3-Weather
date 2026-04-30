@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-constexpr const char* kFwVersion = "1.3.1";
+constexpr const char* kFwVersion = "1.3.2";
 
 namespace cfg {
 
@@ -12,17 +12,24 @@ constexpr int kScreenHeight = 480;
 // Location settings:
 // 1. Set kLocationName to the label you want to use for this dashboard.
 // 2. Set latitude/longitude in decimal degrees. South is negative, east is positive.
-// 3. kMapZoom controls the startup map zoom; 5-7 is the intended touch-cycle range.
+// 3. kMapZoom controls the startup zoom. kMapZoomMin/kMapZoomMax set the touch-cycle
+//    range. Radar and OWM overlay tiles are only available up to zoom 12; above that
+//    the base map still works but overlays will not load.
 // 4. kDefaultMapStyle selects startup map base: 0 = dark, 1 = topo, 2 = OSM.
 // 5. The base-map contrast/brightness values tune tile visibility on the LCD.
 
 constexpr const char* kLocationName = "Putney, NSW, Australia";
 constexpr double kLocationLatitude  = -33.8261;
 constexpr double kLocationLongitude = 151.1063;
-constexpr int kMapZoom = 5;
+constexpr int kMapZoom    = 7;
+constexpr int kMapZoomMin = 5;   // minimum touch-cycle zoom
+constexpr int kMapZoomMax = 12;  // maximum touch-cycle zoom (overlay tiles top out here)
 constexpr int kDefaultMapStyle = 1;          // 0 = dark, 1 = topo, 2 = OSM
 constexpr int kBaseMapContrastPercent = 125; // 100 = unchanged
 constexpr int kBaseMapBrightness = 18;       // -255 to 255, applied after contrast
+constexpr int kRadarOverlayAlphaPercent = 55; // 0 = invisible, 100 = opaque
+constexpr int kCloudOverlayAlphaPercent = 25; // 0 = invisible, 100 = opaque
+constexpr int kRainOverlayAlphaPercent  = 25; // 0 = invisible, 100 = opaque
 
 constexpr const char* kWifiApName  = "ESP32S3-Weather";
 constexpr const char* kOtaHostname = "ESP32S3-Weather";

@@ -2,12 +2,43 @@
 
 ## Todo
 - Stop screen Glitching
-- Implement WebUI with configuration and replica of TFT
+- Evaluate free-to-use API alternatives based on current usage in the README
+  `## API` section. Keep Open-Meteo as the forecast baseline if
+  non-commercial limits fit the project; compare OpenFreeMap or self-hosted
+  OSM/OpenMapTiles for base maps instead of relying on `tile.openstreetmap.org`;
+  verify RainViewer free-user radar limits before raising zoom or request rate;
+  find a no-key or free-tier replacement for OpenWeatherMap CLOUDS/RAIN overlays
+  and document provider terms, attribution, rate limits, max zoom, tile format,
+  ESP32 TLS/PNG compatibility, and cache strategy before implementation.
+- Extend WebUI with configuration controls after the TFT mirror/touch workflow is stable
 - Indicator on TFT on date of last update on Layer
 - Visual Indicator if downloading in background updated layers
 - Simplify the logs when Fetching Data
-- Evaluate base-map cache separation in `ENHANCEMENTS.md` to improve tile render
-  speed.
+- Evaluate base-map cache separation in `ENHANCEMENTS.md` to improve tile render speed
+- Based on Zoom if data not available then skip display with a status message to advise
+- Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
+
+
+## [1.3.2] 2026-04-29
+
+### Added
+
+- Local LAN WebUI with a BMP TFT mirror, layer cache status table, render
+  progress/status JSON, immediate zoom and brightness controls, hardware
+  environment status, reboot and WiFi reset actions, footer credits/links, and
+  click-to-touch coordinate forwarding.
+- Per-layer RADAR, CLOUDS, and RAIN opacity controls in the WebUI. Overlay alpha
+  is applied over every base map style, and changing a value invalidates the
+  affected rendered layer cache so the next frame reflects the new blend.
+- Zoom range extended from 5–7 to 5–12. `kMapZoomMin` and `kMapZoomMax`
+  constants added to `config.h` so the range is configurable without touching
+  code. Radar and OWM overlay tiles are available up to zoom 12; base map works
+  beyond that if `kMapZoomMax` is raised.
+- Zoom level confirmation message (`ZOOM: N`) restored on the display when the
+  map area is tapped. Shown immediately and cleared by the render flip when the
+  new map is ready — no blocking delay.
+
+---
 
 ## [1.3.1] 2026-04-29
 

@@ -6,6 +6,7 @@
 #include <WiFiManager.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <PNGdec.h>
@@ -53,9 +54,15 @@ const char* mapUrls[] = {
 const char* mapNames[] = {"DARK", "TOPO", "OSM"};
 const char* layerNames[] = {"RADAR", "CLOUDS", "RAIN"};
 const char* owmLayerIds[] = {"", "clouds_new", "precipitation_new"};
+int overlayAlphaPercent[] = {
+  cfg::kRadarOverlayAlphaPercent,
+  cfg::kCloudOverlayAlphaPercent,
+  cfg::kRainOverlayAlphaPercent
+};
 
 WaveshareDisplay gfx;
 WaveshareDisplay& lcd = gfx;
+WebServer webServer(80);
 LGFX_Sprite renderScratch(&lcd);
 LGFX_Sprite cacheRadar(&lcd);
 LGFX_Sprite cacheClouds(&lcd);
@@ -93,8 +100,11 @@ volatile int  renderDiagTileX = 0;
 volatile int  renderDiagTileY = 0;
 volatile unsigned long renderDiagPhaseStartedMs = 0;
 volatile unsigned long renderDiagLastProgressMs = 0;
+volatile uint32_t screenFrameVersion = 0;
 char renderDiagPhase[24] = "idle";
 char renderDiagUrl[180] = "";
+bool webUiStarted = false;
+unsigned long lastUiTouchMs = 0;
 
 constexpr int kTileSize = 256;
 constexpr int kMapCanvasHeight = 415;
@@ -113,6 +123,7 @@ void drawBottomDashboard();
 void drawSideButtons();
 void drawSignature();
 void drawTopDate();
+void drawMapBadges();
 void drawProgressTimer();
 void drawGraphPage(int type);
 void drawWeatherIcon(int x, int y, int code);
@@ -120,6 +131,11 @@ void drawMiniWeatherIcon(int x, int y, int code);
 int getDayOfMonthOffset(struct tm baseTime, int offsetDays);
 bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* httpStatus = nullptr);
 void updateLoadingProgress();
+void updateRenderStatusOverlay(bool force = false);
+void markScreenUpdated();
+void setupWebUi(bool wifiOk);
+void handleWebUiClient();
+bool handleUiTouch(int tx, int ty, bool debounce);
 
 PNG png;
 int globalX, globalY;
@@ -329,6 +345,23 @@ uint16_t enhanceBaseMapPixel(uint16_t bigEndianRgb565) {
   return __builtin_bswap16(rgb565);
 }
 
+uint16_t blendRgb565(uint16_t src, uint16_t dst, uint8_t alpha) {
+  if (alpha == 0) return dst;
+  if (alpha >= 255) return src;
+
+  int sr = (src >> 11) & 0x1F;
+  int sg = (src >> 5) & 0x3F;
+  int sb = src & 0x1F;
+  int dr = (dst >> 11) & 0x1F;
+  int dg = (dst >> 5) & 0x3F;
+  int db = dst & 0x1F;
+
+  int r = (sr * alpha + dr * (255 - alpha)) / 255;
+  int g = (sg * alpha + dg * (255 - alpha)) / 255;
+  int b = (sb * alpha + db * (255 - alpha)) / 255;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 int pngDrawCanvas(PNGDRAW *pDraw) {
   uint16_t pix[256];
   png.getLineAsRGB565(pDraw, pix, PNG_RGB565_BIG_ENDIAN, 0);
@@ -341,17 +374,28 @@ int pngDrawCanvas(PNGDRAW *pDraw) {
 
 int pngDrawOverlayCanvas(PNGDRAW *pDraw) {
   uint16_t pix[256];
-  png.getLineAsRGB565(pDraw, pix, PNG_RGB565_BIG_ENDIAN, 0);
+  png.getLineAsRGB565(pDraw, pix, PNG_RGB565_LITTLE_ENDIAN, 0);
+  int alphaPercent = 100;
+  if (renderLayerStyle >= 0 && renderLayerStyle < 3) {
+    alphaPercent = constrain(overlayAlphaPercent[renderLayerStyle], 0, 100);
+  }
 
   for (int x = 0; x < pDraw->iWidth; x++) {
     uint16_t c = pix[x];
     if (c == 0) continue;
 
-    if (layerStyle == 1) {
-      if (((globalX + x + globalY + pDraw->y) & 1) != 0) continue;
+    int sx = globalX + x;
+    int sy = globalY + pDraw->y;
+    if (sx < 0 || sx >= cfg::kScreenWidth || sy < 0 || sy >= kMapCanvasHeight) continue;
+    if (alphaPercent <= 0) continue;
+
+    if (alphaPercent < 100) {
+      uint8_t alpha = (uint8_t)constrain((alphaPercent * 255) / 100, 0, 255);
+      uint16_t base = renderTarget->readPixel(sx, sy);
+      c = blendRgb565(c, base, alpha);
     }
 
-    renderTarget->drawPixel(globalX + x, globalY + pDraw->y, c);
+    renderTarget->drawPixel(sx, sy, c);
   }
   return 1;
 }
@@ -512,6 +556,621 @@ uint16_t layerAgeColor(int targetLayer) {
 
   if (layerRenderInProgress(targetLayer) || (renderPending && pendingLayerStyle == targetLayer)) return TFT_YELLOW;
   return TFT_DARKGREY;
+}
+
+void markScreenUpdated() {
+  screenFrameVersion = screenFrameVersion + 1;
+}
+
+const char* renderStateName() {
+  switch (renderState) {
+    case RENDER_IDLE:  return "idle";
+    case RENDER_BUSY:  return "busy";
+    case RENDER_READY: return "ready";
+  }
+  return "unknown";
+}
+
+String layerCacheStatusName(int layer) {
+  if (layerRenderInProgress(layer)) return "updating";
+  if (renderPending && pendingLayerStyle == layer) return "queued";
+  if (!layerCaches[layer].valid) return "missing";
+  if (!layerCacheMatches(layer)) return "mismatch";
+  if (!layerCacheFresh(layer)) return "stale";
+  return "fresh";
+}
+
+String jsonEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+String buildStatusJson() {
+  String json;
+  json.reserve(2200);
+  json += "{";
+  json += "\"frameVersion\":" + String((uint32_t)screenFrameVersion);
+  json += ",\"uptimeMs\":" + String(millis());
+  json += ",\"appState\":" + String(appState);
+  json += ",\"layer\":\"" + String(layerNames[layerStyle]) + "\"";
+  json += ",\"map\":\"" + String(mapNames[mapStyle]) + "\"";
+  json += ",\"zoom\":" + String(myZoom);
+  json += ",\"renderState\":\"" + String(renderStateName()) + "\"";
+  json += ",\"renderLayer\":\"" + String(layerNames[renderLayerStyle]) + "\"";
+  json += ",\"renderTilesDone\":" + String((int)renderTilesDone);
+  json += ",\"renderTilesTotal\":" + String((int)renderTilesTotal);
+  json += ",\"lastUpdateAgeSec\":" + String((millis() - lastUpdate) / 1000UL);
+  json += ",\"refreshSec\":" + String(cfg::kRealtimeRefreshSecs);
+  json += ",\"brightness\":" + String(brightnessLevel);
+  json += ",\"overlayAlpha\":{";
+  json += "\"radar\":" + String(overlayAlphaPercent[0]);
+  json += ",\"clouds\":" + String(overlayAlphaPercent[1]);
+  json += ",\"rain\":" + String(overlayAlphaPercent[2]);
+  json += "}";
+  json += ",\"hardware\":{";
+  json += "\"ip\":\"" + jsonEscape(WiFi.localIP().toString()) + "\"";
+  json += ",\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\"";
+  json += ",\"rssi\":" + String(WiFi.RSSI());
+  json += ",\"heapFree\":" + String(ESP.getFreeHeap());
+  json += ",\"heapMin\":" + String(ESP.getMinFreeHeap());
+  json += ",\"heapLargest\":" + String(largestInternalBlock());
+  json += ",\"psramFree\":" + String(ESP.getFreePsram());
+  json += ",\"psramLargest\":" + String(largestPsramBlock());
+  json += ",\"flashSize\":" + String(ESP.getFlashChipSize());
+  json += ",\"chipModel\":\"" + jsonEscape(String(ESP.getChipModel())) + "\"";
+  json += ",\"cpuMhz\":" + String(ESP.getCpuFreqMHz());
+  json += "}";
+  json += ",\"layers\":[";
+  for (int i = 0; i < 3; i++) {
+    if (i) json += ",";
+    char ageLabel[16];
+    formatLayerAgeLabel(i, ageLabel, sizeof(ageLabel));
+    json += "{";
+    json += "\"name\":\"" + String(layerNames[i]) + "\"";
+    json += ",\"status\":\"" + layerCacheStatusName(i) + "\"";
+    json += ",\"valid\":" + String(layerCaches[i].valid ? "true" : "false");
+    json += ",\"matches\":" + String(layerCacheMatches(i) ? "true" : "false");
+    json += ",\"fresh\":" + String(layerCacheFresh(i) ? "true" : "false");
+    json += ",\"ageSec\":" + String(layerCacheAgeSecs(i));
+    json += ",\"ageLabel\":\"" + String(ageLabel) + "\"";
+    json += ",\"zoom\":" + String(layerCaches[i].zoom);
+    json += ",\"map\":\"" + String(layerCaches[i].mapStyle >= 0 && layerCaches[i].mapStyle < 3 ? mapNames[layerCaches[i].mapStyle] : "--") + "\"";
+    json += "}";
+  }
+  json += "]}";
+  return json;
+}
+
+const char kWebUiHtml[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ESP32S3 Weather</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071014;
+      --panel: rgba(18, 31, 38, .82);
+      --panel-strong: rgba(24, 43, 52, .95);
+      --line: rgba(166, 205, 218, .18);
+      --text: #edf8fb;
+      --muted: #94aeb7;
+      --accent: #4dd5ff;
+      --accent2: #86efac;
+      --warn: #f7cf6a;
+      --bad: #fb7185;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 28px 18px;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(77, 213, 255, .18), transparent 32%),
+        radial-gradient(circle at 82% 10%, rgba(134, 239, 172, .13), transparent 30%),
+        linear-gradient(160deg, #071014 0%, #10242c 58%, #091216 100%);
+    }
+    main { width: min(1120px, 100%); margin: 0 auto; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 0 0 18px; }
+    h1 { font-size: clamp(22px, 3vw, 34px); margin: 0; letter-spacing: 0; }
+    .sub { margin: 5px 0 0; color: var(--muted); font-size: 14px; }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; color: var(--muted); background: rgba(255,255,255,.04); font-size: 13px; white-space: nowrap; }
+    .mirror-wrap {
+      background: #000;
+      border: 1px solid rgba(255,255,255,.24);
+      border-radius: 12px;
+      width: min(800px, 100%);
+      line-height: 0;
+      overflow: hidden;
+      box-shadow: 0 24px 80px rgba(0,0,0,.42), 0 0 0 1px rgba(77,213,255,.06);
+    }
+    #mirror { width: 100%; height: auto; image-rendering: auto; cursor: crosshair; user-select: none; }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 18px; color: var(--muted); font-size: 13px; }
+    .meta span { border: 1px solid var(--line); background: rgba(255,255,255,.045); border-radius: 999px; padding: 7px 10px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; align-items: start; }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      box-shadow: 0 14px 44px rgba(0,0,0,.24);
+      padding: 16px;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 15px; letter-spacing: 0; }
+    .control { display: grid; grid-template-columns: 104px 1fr 58px; gap: 12px; align-items: center; margin: 12px 0; }
+    .control label { color: var(--muted); font-size: 13px; }
+    output { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
+    input[type=range] { width: 100%; accent-color: var(--accent); }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: rgba(255,255,255,.07);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover { border-color: rgba(77,213,255,.55); background: rgba(77,213,255,.12); }
+    button.danger:hover { border-color: rgba(251,113,133,.7); background: rgba(251,113,133,.14); }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; }
+    th { color: var(--muted); font-weight: 650; }
+    .fresh { color: var(--accent2); }
+    .stale, .queued, .updating { color: var(--warn); }
+    .missing, .mismatch { color: var(--bad); }
+    .hw { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .metric { border: 1px solid var(--line); background: rgba(255,255,255,.045); border-radius: 10px; padding: 10px; min-width: 0; }
+    .metric .k { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .metric .v { display: block; overflow-wrap: anywhere; font-size: 14px; font-variant-numeric: tabular-nums; }
+    footer { color: var(--muted); display: flex; flex-wrap: wrap; gap: 10px 16px; margin: 20px 0 0; font-size: 13px; }
+    a { color: #7dd3fc; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } header { align-items: start; flex-direction: column; } .hw { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>ESP32S3 Weather</h1>
+        <p class="sub">Live TFT mirror, cache telemetry, and LAN controls.</p>
+      </div>
+      <div class="pill" id="ipPill">LAN</div>
+    </header>
+    <div class="mirror-wrap"><img id="mirror" src="/screen.bmp?v=0" width="800" height="480" alt="TFT mirror"></div>
+    <div class="meta">
+      <span>Frame <strong id="frame">0</strong></span>
+      <span>Layer <strong id="layer">--</strong></span>
+      <span>Map <strong id="map">--</strong></span>
+      <span>Zoom <strong id="zoom">--</strong></span>
+      <span>Render <strong id="render">--</strong></span>
+      <span class="dim" id="touchResult"></span>
+    </div>
+    <div class="grid">
+      <section class="card">
+        <h2>Layer Cache</h2>
+        <table>
+          <thead><tr><th>Layer</th><th>Status</th><th>Age</th><th>Cache Zoom</th><th>Cache Map</th></tr></thead>
+          <tbody id="layers"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <h2>Controls</h2>
+        <div class="control">
+          <label for="zoomControl">Zoom</label>
+          <input id="zoomControl" type="range" min="5" max="12" step="1" value="7">
+          <output id="zoomOut">7</output>
+        </div>
+        <div class="control">
+          <label for="brightnessControl">Brightness</label>
+          <input id="brightnessControl" type="range" min="20" max="255" step="1" value="100">
+          <output id="brightnessOut">100</output>
+        </div>
+        <div class="control">
+          <label for="radarAlphaControl">Radar opacity</label>
+          <input id="radarAlphaControl" type="range" min="0" max="100" step="1" value="55">
+          <output id="radarAlphaOut">55%</output>
+        </div>
+        <div class="control">
+          <label for="cloudAlphaControl">Cloud opacity</label>
+          <input id="cloudAlphaControl" type="range" min="0" max="100" step="1" value="25">
+          <output id="cloudAlphaOut">25%</output>
+        </div>
+        <div class="control">
+          <label for="rainAlphaControl">Rain opacity</label>
+          <input id="rainAlphaControl" type="range" min="0" max="100" step="1" value="25">
+          <output id="rainAlphaOut">25%</output>
+        </div>
+      </section>
+      <section class="card">
+        <h2>Hardware</h2>
+        <div class="hw" id="hardware"></div>
+        <div class="actions">
+          <button id="rebootBtn" class="danger">Reboot</button>
+          <button id="resetWifiBtn" class="danger">Reset WiFi Settings</button>
+        </div>
+      </section>
+    </div>
+    <footer>
+      <span>Credits: Mirko Pavleski and Anthony Clarke.</span>
+      <a href="https://bsky.app/profile/anthonyjclarke.bsky.social" target="_blank" rel="noopener">BlueSky</a>
+      <a href="https://github.com/anthonyjclarke/ESP32S3-Weather" target="_blank" rel="noopener">GitHub Repo</a>
+    </footer>
+  </main>
+  <script>
+    const mirror = document.getElementById('mirror');
+    const zoomControl = document.getElementById('zoomControl');
+    const brightnessControl = document.getElementById('brightnessControl');
+    const radarAlphaControl = document.getElementById('radarAlphaControl');
+    const cloudAlphaControl = document.getElementById('cloudAlphaControl');
+    const rainAlphaControl = document.getElementById('rainAlphaControl');
+    const zoomOut = document.getElementById('zoomOut');
+    const brightnessOut = document.getElementById('brightnessOut');
+    const radarAlphaOut = document.getElementById('radarAlphaOut');
+    const cloudAlphaOut = document.getElementById('cloudAlphaOut');
+    const rainAlphaOut = document.getElementById('rainAlphaOut');
+    let lastFrame = -1;
+    let settingTimer = 0;
+    let activeControl = null;
+
+    function text(id, value) { document.getElementById(id).textContent = value; }
+    function kb(v) { return `${Math.round(v / 1024)} KB`; }
+
+    function metric(label, value) {
+      return `<div class="metric"><span class="k">${label}</span><span class="v">${value}</span></div>`;
+    }
+
+    function drawStatus(s) {
+      text('frame', s.frameVersion);
+      text('layer', s.layer);
+      text('map', s.map);
+      text('zoom', s.zoom);
+      const progress = s.renderTilesTotal > 0 ? ` ${s.renderTilesDone}/${s.renderTilesTotal}` : '';
+      text('render', `${s.renderState}${progress}`);
+      document.getElementById('ipPill').textContent = s.hardware.ip || 'LAN';
+      if (activeControl !== 'zoom') {
+        zoomControl.value = s.zoom;
+        zoomOut.textContent = s.zoom;
+      }
+      if (activeControl !== 'brightness') {
+        brightnessControl.value = s.brightness;
+        brightnessOut.textContent = s.brightness;
+      }
+      if (s.overlayAlpha) {
+        if (activeControl !== 'radarAlpha') {
+          radarAlphaControl.value = s.overlayAlpha.radar;
+          radarAlphaOut.textContent = `${s.overlayAlpha.radar}%`;
+        }
+        if (activeControl !== 'cloudAlpha') {
+          cloudAlphaControl.value = s.overlayAlpha.clouds;
+          cloudAlphaOut.textContent = `${s.overlayAlpha.clouds}%`;
+        }
+        if (activeControl !== 'rainAlpha') {
+          rainAlphaControl.value = s.overlayAlpha.rain;
+          rainAlphaOut.textContent = `${s.overlayAlpha.rain}%`;
+        }
+      }
+      document.getElementById('layers').innerHTML = s.layers.map(l =>
+        `<tr><td>${l.name}</td><td class="${l.status}">${l.status}</td><td>${l.ageLabel} (${l.ageSec}s)</td><td>${l.valid ? l.zoom : '--'}</td><td>${l.valid ? l.map : '--'}</td></tr>`
+      ).join('');
+      document.getElementById('hardware').innerHTML = [
+        metric('IP Address', s.hardware.ip),
+        metric('SSID / RSSI', `${s.hardware.ssid || '--'} / ${s.hardware.rssi} dBm`),
+        metric('Heap Free', kb(s.hardware.heapFree)),
+        metric('Largest Heap Block', kb(s.hardware.heapLargest)),
+        metric('Min Heap', kb(s.hardware.heapMin)),
+        metric('PSRAM Free', kb(s.hardware.psramFree)),
+        metric('Largest PSRAM Block', kb(s.hardware.psramLargest)),
+        metric('Flash / CPU', `${kb(s.hardware.flashSize)} / ${s.hardware.cpuMhz} MHz`)
+      ].join('');
+    }
+
+    async function poll() {
+      try {
+        const s = await fetch('/api/status', { cache: 'no-store' }).then(r => r.json());
+        drawStatus(s);
+        if (s.frameVersion !== lastFrame) {
+          lastFrame = s.frameVersion;
+          mirror.src = `/screen.bmp?v=${s.frameVersion}&t=${Date.now()}`;
+        }
+      } catch (err) {
+        text('render', 'offline');
+      }
+    }
+
+    mirror.addEventListener('click', async (event) => {
+      const r = mirror.getBoundingClientRect();
+      const x = Math.max(0, Math.min(799, Math.round((event.clientX - r.left) * 800 / r.width)));
+      const y = Math.max(0, Math.min(479, Math.round((event.clientY - r.top) * 480 / r.height)));
+      const result = document.getElementById('touchResult');
+      try {
+        const response = await fetch('/api/touch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x, y })
+        });
+        result.textContent = response.ok ? `touch ${x},${y}` : 'touch failed';
+        poll();
+      } catch (err) {
+        result.textContent = 'touch failed';
+      }
+    });
+
+    async function setConfig(payload) {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      poll();
+    }
+
+    function scheduleConfig(type, value) {
+      activeControl = type;
+      clearTimeout(settingTimer);
+      settingTimer = setTimeout(async () => {
+        const payload = {};
+        payload[type] = Number(value);
+        try { await setConfig(payload); } finally { activeControl = null; }
+      }, 120);
+    }
+
+    zoomControl.addEventListener('input', () => {
+      zoomOut.textContent = zoomControl.value;
+      scheduleConfig('zoom', zoomControl.value);
+    });
+
+    brightnessControl.addEventListener('input', () => {
+      brightnessOut.textContent = brightnessControl.value;
+      scheduleConfig('brightness', brightnessControl.value);
+    });
+
+    radarAlphaControl.addEventListener('input', () => {
+      radarAlphaOut.textContent = `${radarAlphaControl.value}%`;
+      scheduleConfig('radarAlpha', radarAlphaControl.value);
+    });
+
+    cloudAlphaControl.addEventListener('input', () => {
+      cloudAlphaOut.textContent = `${cloudAlphaControl.value}%`;
+      scheduleConfig('cloudAlpha', cloudAlphaControl.value);
+    });
+
+    rainAlphaControl.addEventListener('input', () => {
+      rainAlphaOut.textContent = `${rainAlphaControl.value}%`;
+      scheduleConfig('rainAlpha', rainAlphaControl.value);
+    });
+
+    document.getElementById('rebootBtn').addEventListener('click', async () => {
+      if (!confirm('Reboot the ESP32 now?')) return;
+      await fetch('/api/reboot', { method: 'POST' });
+      text('render', 'rebooting');
+    });
+
+    document.getElementById('resetWifiBtn').addEventListener('click', async () => {
+      if (!confirm('Reset saved WiFi settings and reboot?')) return;
+      await fetch('/api/reset-wifi', { method: 'POST' });
+      text('render', 'resetting WiFi');
+    });
+
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>
+)HTML";
+
+void handleWebRoot() {
+  webServer.send_P(200, "text/html", kWebUiHtml);
+}
+
+void handleWebStatus() {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", buildStatusJson());
+}
+
+void handleWebScreenBmp() {
+  const int width = cfg::kScreenWidth;
+  const int height = cfg::kScreenHeight;
+  const int rowSize = (width * 3 + 3) & ~3;
+  const uint32_t imageSize = rowSize * height;
+
+  lgfx::bitmap_header_t bmp = {};
+  bmp.bfType = 0x4D42;
+  bmp.bfSize = sizeof(bmp) + imageSize;
+  bmp.bfOffBits = sizeof(bmp);
+  bmp.biSize = 40;
+  bmp.biWidth = width;
+  bmp.biHeight = height;
+  bmp.biPlanes = 1;
+  bmp.biBitCount = 24;
+  bmp.biCompression = 0;
+  bmp.biSizeImage = imageSize;
+
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.setContentLength(bmp.bfSize);
+  webServer.send(200, "image/bmp", "");
+
+  NetworkClient& client = webServer.client();
+  client.write((const uint8_t*)&bmp, sizeof(bmp));
+
+  static uint8_t rowBuf[cfg::kScreenWidth * 3];
+  for (int y = height - 1; y >= 0 && client.connected(); y--) {
+    gfx.readRect(0, y, width, 1, (lgfx::rgb888_t*)rowBuf);
+    client.write(rowBuf, rowSize);
+    delay(1);
+  }
+}
+
+void handleWebTouch() {
+  int tx = -1;
+  int ty = -1;
+
+  if (webServer.hasArg("plain")) {
+    StaticJsonDocument<128> doc;
+    if (deserializeJson(doc, webServer.arg("plain")) == DeserializationError::Ok) {
+      tx = doc["x"] | -1;
+      ty = doc["y"] | -1;
+    }
+  }
+
+  if (tx < 0 && webServer.hasArg("x")) tx = webServer.arg("x").toInt();
+  if (ty < 0 && webServer.hasArg("y")) ty = webServer.arg("y").toInt();
+
+  if (tx < 0 || tx >= cfg::kScreenWidth || ty < 0 || ty >= cfg::kScreenHeight) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid coordinates\"}");
+    return;
+  }
+
+  bool handled = handleUiTouch(tx, ty, true);
+  webServer.send(200, "application/json", String("{\"ok\":") + (handled ? "true" : "false") + "}");
+}
+
+void handleWebConfig() {
+  if (!webServer.hasArg("plain")) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
+    return;
+  }
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, webServer.arg("plain"));
+  if (err) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid json\"}");
+    return;
+  }
+
+  bool changed = false;
+  bool currentLayerAlphaChanged = false;
+
+  if (doc.containsKey("brightness")) {
+    int requested = doc["brightness"] | brightnessLevel;
+    brightnessLevel = constrain(requested, 20, 255);
+    setBacklightBrightness(brightnessLevel);
+    if (appState == 0) drawProgressTimer();
+    changed = true;
+  }
+
+  if (doc.containsKey("zoom")) {
+    int requested = doc["zoom"] | myZoom;
+    int nextZoom = constrain(requested, cfg::kMapZoomMin, cfg::kMapZoomMax);
+    if (nextZoom != myZoom) {
+      myZoom = nextZoom;
+      DBG_INFO("WebUI zoom → %d", myZoom);
+      invalidateLayerCaches();
+      layerCycleLastMs = millis();
+      triggerRenderForLayer(layerStyle, true);
+
+      if (appState == 0) {
+        drawMapBadges();
+      }
+      changed = true;
+    }
+  }
+
+  if (doc.containsKey("radarAlpha")) {
+    int requested = doc["radarAlpha"] | overlayAlphaPercent[0];
+    int nextAlpha = constrain(requested, 0, 100);
+    if (nextAlpha != overlayAlphaPercent[0]) {
+      overlayAlphaPercent[0] = nextAlpha;
+      layerCaches[0].valid = false;
+      currentLayerAlphaChanged = currentLayerAlphaChanged || layerStyle == 0;
+      changed = true;
+    }
+  }
+
+  if (doc.containsKey("cloudAlpha")) {
+    int requested = doc["cloudAlpha"] | overlayAlphaPercent[1];
+    int nextAlpha = constrain(requested, 0, 100);
+    if (nextAlpha != overlayAlphaPercent[1]) {
+      overlayAlphaPercent[1] = nextAlpha;
+      layerCaches[1].valid = false;
+      currentLayerAlphaChanged = currentLayerAlphaChanged || layerStyle == 1;
+      changed = true;
+    }
+  }
+
+  if (doc.containsKey("rainAlpha")) {
+    int requested = doc["rainAlpha"] | overlayAlphaPercent[2];
+    int nextAlpha = constrain(requested, 0, 100);
+    if (nextAlpha != overlayAlphaPercent[2]) {
+      overlayAlphaPercent[2] = nextAlpha;
+      layerCaches[2].valid = false;
+      currentLayerAlphaChanged = currentLayerAlphaChanged || layerStyle == 2;
+      changed = true;
+    }
+  }
+
+  if (currentLayerAlphaChanged) {
+    DBG_INFO("WebUI opacity changed | layer=%s alpha=%d%%",
+             layerNames[layerStyle], overlayAlphaPercent[layerStyle]);
+    layerCycleLastMs = millis();
+    triggerRenderForLayer(layerStyle, true);
+  }
+
+  webServer.send(200, "application/json", String("{\"ok\":true,\"changed\":") + (changed ? "true" : "false") + "}");
+}
+
+void handleWebReboot() {
+  webServer.send(200, "application/json", "{\"ok\":true,\"action\":\"reboot\"}");
+  delay(200);
+  ESP.restart();
+}
+
+void handleWebResetWifi() {
+  webServer.send(200, "application/json", "{\"ok\":true,\"action\":\"reset-wifi\"}");
+  delay(200);
+  WiFiManager wm;
+  wm.resetSettings();
+  WiFi.disconnect(true, true);
+  delay(300);
+  ESP.restart();
+}
+
+void setupWebUi(bool wifiOk) {
+  if (!wifiOk) {
+    DBG_WARN("WebUI disabled: WiFi is not connected");
+    return;
+  }
+
+  webServer.on("/", HTTP_GET, handleWebRoot);
+  webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/screen.bmp", HTTP_GET, handleWebScreenBmp);
+  webServer.on("/api/touch", HTTP_POST, handleWebTouch);
+  webServer.on("/api/touch", HTTP_GET, handleWebTouch);
+  webServer.on("/api/config", HTTP_POST, handleWebConfig);
+  webServer.on("/api/reboot", HTTP_POST, handleWebReboot);
+  webServer.on("/api/reset-wifi", HTTP_POST, handleWebResetWifi);
+  webServer.onNotFound([]() {
+    webServer.send(404, "text/plain", "Not found");
+  });
+  webServer.begin();
+  webUiStarted = true;
+  DBG_INFO("WebUI ready | http://%s/", WiFi.localIP().toString().c_str());
+}
+
+void handleWebUiClient() {
+  if (webUiStarted) webServer.handleClient();
 }
 
 void logRenderProgressSummary(int targetLayer, int tilesOk, int tilesErr, unsigned long renderStart) {
@@ -694,6 +1353,7 @@ void drawSignature() {
   lcd.fillRect(35, 388, 80, 22, panelColor);
   lcd.drawRect(35, 388, 80, 22, TFT_WHITE);
   lcd.drawString("OHRID", 35 + 40, 388 + 11);
+  markScreenUpdated();
 }
 
 void setBrightnessFromTouchY(int ty) {
@@ -748,6 +1408,7 @@ void drawOtaStatus(const char* line1, const char* line2, int percent = -1) {
       lcd.fillRect(barX + 1 + fillW, barY + 1, (barW - 2) - fillW, barH - 2, TFT_BLACK);
     }
   }
+  markScreenUpdated();
 }
 
 void setupOta(bool wifiOk) {
@@ -826,6 +1487,7 @@ void drawProgressTimer() {
   int markerY = map(brightnessLevel, 255, 20, by, by + bh);
   lcd.drawFastHLine(bx + 4, markerY, bw - 8, TFT_YELLOW);
   lcd.drawFastHLine(bx + 4, markerY - 1, bw - 8, TFT_YELLOW);
+  markScreenUpdated();
 }
 
 void drawBottomDashboard() {
@@ -900,6 +1562,7 @@ void drawBottomDashboard() {
     lcd.setTextColor(0x7BEF);
     lcd.drawNumber((int)dMin[i], curX + 59, 480 - 22);
   }
+  markScreenUpdated();
 }
 
 void getWeatherData() {
@@ -1276,6 +1939,7 @@ lcd.drawString(unitTxt, 370, 448 );
       }
     }
   }
+  markScreenUpdated();
 }
 
 void latLonToWorldPixels(double lat, double lon, int zoom, double* worldX, double* worldY) {
@@ -1525,6 +2189,7 @@ void drawTopDate() {
   lcd.setTextSize(2);
   lcd.setTextDatum(middle_center);
   lcd.drawString(buf, 660, 17);
+  markScreenUpdated();
 }
 
 void drawSideButtons() {
@@ -1564,6 +2229,7 @@ void drawSideButtons() {
     lcd.setTextDatum(middle_center);
     lcd.drawString(lblL[i], bxL + 17, 50 + (i * 85) + 37);
   }
+  markScreenUpdated();
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,6 +2257,7 @@ void drawMapBadges() {
   formatLayerAgeLabel(layerStyle, ageLabel, sizeof(ageLabel));
   lcd.setTextColor(layerAgeColor(layerStyle));
   lcd.drawString(ageLabel, layerX + layerW / 2, layerY + 28);
+  markScreenUpdated();
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,12 +2297,13 @@ void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
   }
 
   if (renderState == RENDER_BUSY) {
-    renderPending = true;
-    pendingLayerStyle = targetLayer;
-    pendingRenderForce = forceRefresh;
-    DBG_INFO("Render queued | layer=%s force=%d", layerNames[targetLayer], forceRefresh ? 1 : 0);
-    return;
-  }
+      renderPending = true;
+      pendingLayerStyle = targetLayer;
+      pendingRenderForce = forceRefresh;
+      DBG_INFO("Render queued | layer=%s force=%d", layerNames[targetLayer], forceRefresh ? 1 : 0);
+      updateRenderStatusOverlay(true);
+      return;
+    }
   renderTarget = &renderScratch;
   renderLayerStyle = targetLayer;
   renderMapStyle = mapStyle;
@@ -1651,6 +2319,7 @@ void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
   DBG_INFO("Render scheduled | layer=%s force=%d",
            layerNames[targetLayer], forceRefresh ? 1 : 0);
 #endif
+  updateRenderStatusOverlay(true);
   xTaskNotifyGive(renderTaskHandle);
 }
 
@@ -1699,6 +2368,7 @@ void drawStartupScreen(bool wifiOk, const char* ssid, const char* ip) {
   lcd.setTextColor(TFT_CYAN);
   lcd.setTextSize(3);
   lcd.drawString("Loading map...", 400, 390);
+  markScreenUpdated();
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,6 +2402,68 @@ void updateLoadingProgress() {
   if (total > 0) snprintf(buf, sizeof(buf), "%d / %d tiles", done, total);
   else           snprintf(buf, sizeof(buf), "Fetching tiles...");
   lcd.drawString(buf, 400, 448);
+  markScreenUpdated();
+}
+
+void updateRenderStatusOverlay(bool force) {
+  static int lastDone = -1;
+  static int lastTotal = -1;
+  static unsigned long lastDrawMs = 0;
+
+  if (!firstRenderDone || appState != 0 || renderState != RENDER_BUSY) {
+    lastDone = -1;
+    lastTotal = -1;
+    lastDrawMs = 0;
+    return;
+  }
+
+  int done = renderTilesDone;
+  int total = renderTilesTotal;
+  unsigned long now = millis();
+  if (!force && done == lastDone && total == lastTotal && now - lastDrawMs < 1000) return;
+
+  lastDone = done;
+  lastTotal = total;
+  lastDrawMs = now;
+
+  constexpr int x = 245;
+  constexpr int y = 170;
+  constexpr int w = 310;
+  constexpr int h = 96;
+  constexpr int barX = x + 22;
+  constexpr int barY = y + 66;
+  constexpr int barW = w - 44;
+  constexpr int barH = 12;
+
+  lcd.fillRect(x, y, w, h, panelColor);
+  lcd.drawRect(x, y, w, h, TFT_WHITE);
+  lcd.setTextDatum(middle_center);
+  lcd.setTextColor(TFT_YELLOW);
+  lcd.setTextSize(2);
+  lcd.drawString("Loading map", x + w / 2, y + 20);
+
+  char status[64];
+  if (total > 0) {
+    snprintf(status, sizeof(status), "%s  zoom %d  %d/%d",
+             layerNames[renderLayerStyle], renderZoom, done, total);
+  } else {
+    snprintf(status, sizeof(status), "%s  zoom %d  starting",
+             layerNames[renderLayerStyle], renderZoom);
+  }
+
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.drawString(status, x + w / 2, y + 47);
+
+  lcd.drawRect(barX, barY, barW, barH, TFT_DARKGREY);
+  int fillW = 0;
+  if (total > 0) fillW = (int)((long)done * (barW - 2) / total);
+  if (fillW > 0) lcd.fillRect(barX + 1, barY + 1, fillW, barH - 2, TFT_CYAN);
+  if (fillW < barW - 2) {
+    lcd.fillRect(barX + 1 + fillW, barY + 1, (barW - 2) - fillW, barH - 2, TFT_BLACK);
+  }
+
+  markScreenUpdated();
 }
 
 // ---------------------------------------------------------------------------
@@ -1825,6 +2557,79 @@ void renderTaskFn(void*) {
 
 // ---------------------------------------------------------------------------
 
+bool handleUiTouch(int tx, int ty, bool debounce) {
+  if (appState == 0 && tx >= 0 && tx <= 32 && ty >= 4 && ty <= 413) {
+    setBrightnessFromTouchY(ty);
+    drawProgressTimer();
+    return true;
+  }
+
+  if (debounce && millis() - lastUiTouchMs <= 600) return false;
+
+  bool handled = false;
+
+  if (appState == 0) {
+    // Layer toggle (top centre strip)
+    if (ty > 0 && ty < 40 && tx > 300 && tx < 500) {
+      layerStyle = (layerStyle + 1) % 3;
+      if (layerStyle != 0 && (owmAuthFailed || strlen(owmApiKey) == 0)) layerStyle = 0;
+      layerCycleLastMs = millis();
+      triggerRenderForLayer(layerStyle, false);
+      drawMapBadges();
+      handled = true;
+    }
+    // Map style toggle (bottom centre strip)
+    else if (tx > 310 && tx < 490 && ty > 385 && ty < 480) {
+      mapStyle = (mapStyle + 1) % 3;
+      invalidateLayerCaches();
+      layerCycleLastMs = millis();
+      triggerRenderForLayer(layerStyle, true);
+      drawMapBadges();
+      handled = true;
+    }
+    // Right side graph buttons
+    else if (tx > 760) {
+      if      (ty > 50  && ty < 125) appState = 1, drawGraphPage(1), handled = true;
+      else if (ty > 135 && ty < 210) appState = 2, drawGraphPage(2), handled = true;
+      else if (ty > 220 && ty < 295) appState = 3, drawGraphPage(3), handled = true;
+      else if (ty > 305 && ty < 380) appState = 4, drawGraphPage(4), handled = true;
+    }
+    // Left side graph buttons
+    else if (tx > 32 && tx < 66) {
+      if      (ty > 50  && ty < 125) appState = 5, drawGraphPage(5), handled = true;
+      else if (ty > 135 && ty < 210) appState = 6, drawGraphPage(6), handled = true;
+      else if (ty > 220 && ty < 295) appState = 7, drawGraphPage(7), handled = true;
+      else if (ty > 305 && ty < 380) appState = 8, drawGraphPage(8), handled = true;
+    }
+    // Zoom (centre map area)
+    else if (tx > 250 && tx < 550 && ty > 100 && ty < 380) {
+      myZoom++;
+      if (myZoom > cfg::kMapZoomMax) myZoom = cfg::kMapZoomMin;
+      DBG_INFO("Zoom → %d", myZoom);
+      invalidateLayerCaches();
+      layerCycleLastMs = millis();
+      triggerRenderForLayer(layerStyle, true);
+      drawMapBadges();
+      handled = true;
+    }
+  }
+  // Back from graph page
+  else if (tx < 150 && ty > 400) {
+    appState = 0;
+    lcd.fillScreen(TFT_BLACK);
+    mapFront->pushSprite(0, 0);
+    drawMapBadges();
+    drawBottomDashboard();
+    drawSideButtons();
+    drawSignature();
+    drawTopDate();
+    handled = true;
+  }
+
+  if (handled) lastUiTouchMs = millis();
+  return handled;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -1841,6 +2646,7 @@ void setup() {
   lcd.setTextSize(3);
   lcd.setTextDatum(middle_center);
   lcd.drawString("Connecting...", 400, 240);
+  markScreenUpdated();
 
   bool wifiOk = initWiFi();
   String ip = "";
@@ -1849,6 +2655,7 @@ void setup() {
     ip = WiFi.localIP().toString();
   }
   setupOta(wifiOk);
+  setupWebUi(wifiOk);
 
   renderScratch.setPsram(true);
   cacheRadar.setPsram(true);
@@ -1873,6 +2680,7 @@ void setup() {
   lcd.drawString("Loading map...", 400, 390);  // erase old text
   lcd.setTextColor(TFT_CYAN);
   lcd.drawString("Fetching map tiles...", 400, 390);
+  markScreenUpdated();
 
   BaseType_t renderTaskOk = xTaskCreatePinnedToCore(
     renderTaskFn,
@@ -1902,8 +2710,10 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lT = 0, lTouch = 0;
+  static unsigned long lT = 0;
   struct tm ti;
+
+  handleWebUiClient();
 
   if (WiFi.isConnected()) {
     ArduinoOTA.handle();
@@ -1925,6 +2735,7 @@ void loop() {
     drawSideButtons();
     drawSignature();
     drawProgressTimer();
+    markScreenUpdated();
     if (renderPending) {
       int queuedLayer = pendingLayerStyle;
       bool queuedForce = pendingRenderForce;
@@ -1940,6 +2751,9 @@ void loop() {
     delay(10);  // yield to RenderTask while the startup screen is waiting
     return;
   }
+
+  updateRenderStatusOverlay(false);
+  pollRenderWatchdog();
 
   // --- Per-minute dashboard update ---
   if (appState == 0 && getLocalTime(&ti)) {
@@ -1970,72 +2784,8 @@ void loop() {
 
   // --- Touch ---
   if (touch_has_signal() && touch_touched()) {
-    int tx = touch_last_x, ty = touch_last_y;
-
-    // Brightness slider (left bar)
-    if (appState == 0 && tx >= 0 && tx <= 32 && ty >= 4 && ty <= 413) {
-      setBrightnessFromTouchY(ty);
-      drawProgressTimer();
+    if (handleUiTouch(touch_last_x, touch_last_y, true)) {
       delay(25);
-      return;
-    }
-
-    if (millis() - lTouch > 600) {
-      if (appState == 0) {
-        // Layer toggle (top centre strip)
-        if (ty > 0 && ty < 40 && tx > 300 && tx < 500) {
-          layerStyle = (layerStyle + 1) % 3;
-          if (layerStyle != 0 && (owmAuthFailed || strlen(owmApiKey) == 0)) layerStyle = 0;
-          layerCycleLastMs = millis();
-          triggerRenderForLayer(layerStyle, false);
-          drawMapBadges();
-        }
-        // Map style toggle (bottom centre strip)
-        else if (tx > 310 && tx < 490 && ty > 385 && ty < 480) {
-          mapStyle = (mapStyle + 1) % 3;
-          invalidateLayerCaches();
-          layerCycleLastMs = millis();
-          triggerRenderForLayer(layerStyle, true);
-          drawMapBadges();
-        }
-        // Right side graph buttons
-        else if (tx > 760) {
-          if      (ty > 50  && ty < 125) appState = 1, drawGraphPage(1);
-          else if (ty > 135 && ty < 210) appState = 2, drawGraphPage(2);
-          else if (ty > 220 && ty < 295) appState = 3, drawGraphPage(3);
-          else if (ty > 305 && ty < 380) appState = 4, drawGraphPage(4);
-        }
-        // Left side graph buttons
-        else if (tx > 32 && tx < 66) {
-          if      (ty > 50  && ty < 125) appState = 5, drawGraphPage(5);
-          else if (ty > 135 && ty < 210) appState = 6, drawGraphPage(6);
-          else if (ty > 220 && ty < 295) appState = 7, drawGraphPage(7);
-          else if (ty > 305 && ty < 380) appState = 8, drawGraphPage(8);
-        }
-        // Zoom (centre map area)
-        else if (tx > 250 && tx < 550 && ty > 100 && ty < 380) {
-          myZoom++;
-          if (myZoom > 7) myZoom = 5;
-          DBG_INFO("Zoom → %d", myZoom);
-          invalidateLayerCaches();
-          layerCycleLastMs = millis();
-          triggerRenderForLayer(layerStyle, true);
-          drawMapBadges();
-        }
-      }
-      // Back from graph page
-      else if (tx < 150 && ty > 400) {
-        appState = 0;
-        lcd.fillScreen(TFT_BLACK);
-        mapFront->pushSprite(0, 0);
-        drawMapBadges();
-        drawBottomDashboard();
-        drawSideButtons();
-        drawSignature();
-        drawTopDate();
-      }
-
-      lTouch = millis();
     }
   }
 

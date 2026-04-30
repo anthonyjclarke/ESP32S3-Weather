@@ -96,7 +96,9 @@ All location/map settings are in the `cfg::` namespace:
 cfg::kLocationName          // display label
 cfg::kLocationLatitude      // decimal degrees, south = negative
 cfg::kLocationLongitude     // decimal degrees, east = positive
-cfg::kMapZoom               // startup zoom 5–7
+cfg::kMapZoom               // startup zoom level
+cfg::kMapZoomMin            // minimum touch-cycle zoom (default 5)
+cfg::kMapZoomMax            // maximum touch-cycle zoom (default 12 — overlay tiles top out here)
 cfg::kDefaultMapStyle       // 0 = dark, 1 = topo, 2 = OSM
 cfg::kBaseMapContrastPercent // 100 = unchanged
 cfg::kBaseMapBrightness     // -255 to 255
