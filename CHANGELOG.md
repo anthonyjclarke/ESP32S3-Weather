@@ -10,14 +10,33 @@
   find a no-key or free-tier replacement for OpenWeatherMap CLOUDS/RAIN overlays
   and document provider terms, attribution, rate limits, max zoom, tile format,
   ESP32 TLS/PNG compatibility, and cache strategy before implementation.
-- Extend WebUI with configuration controls after the TFT mirror/touch workflow is stable
-- Indicator on TFT on date of last update on Layer
-- Visual Indicator if downloading in background updated layers
-- Simplify the logs when Fetching Data
 - Evaluate base-map cache separation in `ENHANCEMENTS.md` to improve tile render speed
 - Based on Zoom if data not available then skip display with a status message to advise
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
+
+## [1.4.0] 2026-05-02
+
+### Added
+
+- Night sleep schedule feature. When enabled, the display turns off at a
+  configurable time each night and wakes on touch. A 2-second "In Sleep mode,
+  touch to wake up" message is shown before the backlight turns off.
+- Fixed HH:MM sleep-start and wake times, configurable from the WebUI.
+  Window may cross midnight (e.g. 22:00–07:00).
+- Touch-to-wake during sleep window: a physical touch or a WebUI click on the
+  TFT mirror restores the full dashboard for `kSleepWakeDurationSecs`
+  (default 5 min), then the display re-sleeps if still inside the window.
+- Sleep schedule controls added to WebUI Night Schedule card: enable/disable
+  toggle, sleep-at / wake-at time inputs, and a live status line showing
+  current sleep state, window times, and remaining wake time.
+- Sleep settings persisted in NVS via `Preferences` ("sleepsch" namespace).
+  Config defaults documented in `config.h` (`kSleepScheduleEnabled`,
+  `kSleepOnHour/Minute`, `kSleepOffHour/Minute`, `kSleepWakeDurationSecs`).
+- `buildStatusJson()` extended with a `sleep` object exposing all schedule
+  state for WebUI polling (state, in-window flag, wake countdown).
+- Background renders that complete during sleep no longer update the LCD
+  (cache update still happens; display restores correctly on wake).
 
 ## [1.3.2] 2026-04-29
 

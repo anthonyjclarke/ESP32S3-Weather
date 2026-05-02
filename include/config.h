@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-constexpr const char* kFwVersion = "1.3.2";
+constexpr const char* kFwVersion = "1.4.0";
 
 namespace cfg {
 
@@ -40,6 +40,20 @@ constexpr uint32_t    kRenderTaskStackBytes = 32768;
 constexpr UBaseType_t kRenderTaskPriority = 1;
 constexpr uint32_t    kRenderStallWarnMs = 10000;
 constexpr uint32_t    kRenderStallRepeatMs = 10000;
+
+// Night sleep schedule:
+// kSleepScheduleEnabled: master on/off (default off — enable via WebUI or set true here).
+// kSleepOnHour / kSleepOnMinute: sleep-start time (display turns off). Window may cross
+//   midnight (e.g. 22:00–07:00).
+// kSleepOffHour / kSleepOffMinute: wake time (display turns back on).
+// kSleepWakeDurationSecs: how long to stay awake after a touch during the sleep window.
+// All values are overridden by NVS once saved from the WebUI.
+constexpr bool kSleepScheduleEnabled  = false;
+constexpr int  kSleepOnHour           = 22;
+constexpr int  kSleepOnMinute         = 0;
+constexpr int  kSleepOffHour          = 7;
+constexpr int  kSleepOffMinute        = 0;
+constexpr int  kSleepWakeDurationSecs = 300;
 
 constexpr int kPinD0  = 14;
 constexpr int kPinD1  = 38;

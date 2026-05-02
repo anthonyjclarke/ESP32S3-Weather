@@ -14,6 +14,7 @@
 #include <math.h>
 #include "time.h"
 #include <Wire.h>
+#include <Preferences.h>
 #include "config.h"
 #include "debug.h"
 #include "display_hw.h"
@@ -106,6 +107,24 @@ char renderDiagUrl[180] = "";
 bool webUiStarted = false;
 unsigned long lastUiTouchMs = 0;
 
+// --- Night sleep schedule ---
+Preferences prefs;
+bool     sleepScheduleEnabled  = cfg::kSleepScheduleEnabled;
+int      sleepOnHour           = cfg::kSleepOnHour;
+int      sleepOnMinute         = cfg::kSleepOnMinute;
+int      sleepOffHour          = cfg::kSleepOffHour;
+int      sleepOffMinute        = cfg::kSleepOffMinute;
+int      sleepWakeDurationSecs = cfg::kSleepWakeDurationSecs;
+
+enum SleepPhase : uint8_t {
+  SLEEP_AWAKE,        // normal operation
+  SLEEP_PENDING,      // showing sleep message, BL off in 2 s
+  SLEEP_DARK,         // backlight off
+  SLEEP_TOUCH_WOKEN   // touch-woken during window, re-sleeps after timeout
+};
+SleepPhase   sleepPhase   = SLEEP_AWAKE;
+unsigned long sleepPhaseMs = 0;
+
 constexpr int kTileSize = 256;
 constexpr int kMapCanvasHeight = 415;
 
@@ -136,6 +155,12 @@ void markScreenUpdated();
 void setupWebUi(bool wifiOk);
 void handleWebUiClient();
 bool handleUiTouch(int tx, int ty, bool debounce);
+void loadSleepSettings();
+void saveSleepSettings();
+bool isInSleepWindow();
+void drawSleepScreen();
+void exitSleepRestoreDashboard();
+void pollSleepSchedule();
 
 PNG png;
 int globalX, globalY;
@@ -603,7 +628,7 @@ String jsonEscape(const String& value) {
 
 String buildStatusJson() {
   String json;
-  json.reserve(2200);
+  json.reserve(2700);
   json += "{";
   json += "\"frameVersion\":" + String((uint32_t)screenFrameVersion);
   json += ",\"uptimeMs\":" + String(millis());
@@ -653,7 +678,35 @@ String buildStatusJson() {
     json += ",\"map\":\"" + String(layerCaches[i].mapStyle >= 0 && layerCaches[i].mapStyle < 3 ? mapNames[layerCaches[i].mapStyle] : "--") + "\"";
     json += "}";
   }
-  json += "]}";
+  json += "]";
+
+  // Sleep schedule state
+  {
+    char onBuf[6], offBuf[6];
+    snprintf(onBuf,  sizeof(onBuf),  "%02d:%02d", sleepOnHour,  sleepOnMinute);
+    snprintf(offBuf, sizeof(offBuf), "%02d:%02d", sleepOffHour, sleepOffMinute);
+    const char* stateStr = sleepPhase == SLEEP_PENDING     ? "pending"
+                         : sleepPhase == SLEEP_DARK        ? "dark"
+                         : sleepPhase == SLEEP_TOUCH_WOKEN ? "woken"
+                         : "awake";
+    unsigned long wakeRemain = 0;
+    if (sleepPhase == SLEEP_TOUCH_WOKEN && sleepPhaseMs > 0) {
+      unsigned long elapsedS = (millis() - sleepPhaseMs) / 1000UL;
+      wakeRemain = elapsedS < (unsigned long)sleepWakeDurationSecs
+                 ? (unsigned long)sleepWakeDurationSecs - elapsedS : 0;
+    }
+    json += ",\"sleep\":{";
+    json += "\"enabled\":"    + String(sleepScheduleEnabled ? "true" : "false");
+    json += ",\"onTime\":\""  + String(onBuf)  + "\"";
+    json += ",\"offTime\":\"" + String(offBuf) + "\"";
+    json += ",\"state\":\""  + String(stateStr) + "\"";
+    json += ",\"inWindow\":" + String(isInSleepWindow() ? "true" : "false");
+    json += ",\"wakeSecs\":" + String(sleepWakeDurationSecs);
+    json += ",\"wakeRemainSecs\":" + String(wakeRemain);
+    json += "}";
+  }
+
+  json += "}";
   return json;
 }
 
@@ -748,6 +801,18 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     a { color: #7dd3fc; text-decoration: none; }
     a:hover { text-decoration: underline; }
     @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } header { align-items: start; flex-direction: column; } .hw { grid-template-columns: 1fr; } }
+    .sched-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 0; border-bottom:1px solid var(--line); }
+    .sched-row:last-child { border-bottom:none; }
+    .sched-row > label:first-child { color:var(--muted); font-size:13px; flex:1; }
+    .toggle { position:relative; display:inline-block; width:40px; height:22px; flex-shrink:0; }
+    .toggle input { opacity:0; width:0; height:0; position:absolute; }
+    .slider { position:absolute; cursor:pointer; inset:0; background:#334155; border-radius:22px; transition:.2s; }
+    .slider:before { content:''; position:absolute; height:16px; width:16px; left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.2s; }
+    .toggle input:checked + .slider { background:var(--accent); }
+    .toggle input:checked + .slider:before { transform:translateX(18px); }
+    .time-input { background:var(--panel-strong); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 8px; font:inherit; font-size:13px; width:100px; }
+    .time-input:focus { outline:none; border-color:var(--accent); }
+    .sched-status { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.7; }
   </style>
 </head>
 <body>
@@ -812,6 +877,22 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <button id="resetWifiBtn" class="danger">Reset WiFi Settings</button>
         </div>
       </section>
+      <section class="card">
+        <h2>Night Schedule</h2>
+        <div class="sched-row">
+          <label for="sleepEnabled">Enable schedule</label>
+          <label class="toggle"><input id="sleepEnabled" type="checkbox"><span class="slider"></span></label>
+        </div>
+        <div class="sched-row">
+          <label for="sleepOnTime">Sleep at</label>
+          <input id="sleepOnTime" type="time" class="time-input">
+        </div>
+        <div class="sched-row">
+          <label for="sleepOffTime">Wake at</label>
+          <input id="sleepOffTime" type="time" class="time-input">
+        </div>
+        <div id="sleepStatus" class="sched-status"></div>
+      </section>
     </div>
     <footer>
       <span>Credits: Mirko Pavleski and Anthony Clarke.</span>
@@ -831,6 +912,10 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     const radarAlphaOut = document.getElementById('radarAlphaOut');
     const cloudAlphaOut = document.getElementById('cloudAlphaOut');
     const rainAlphaOut = document.getElementById('rainAlphaOut');
+    const sleepEnabledEl = document.getElementById('sleepEnabled');
+    const sleepOnEl      = document.getElementById('sleepOnTime');
+    const sleepOffEl     = document.getElementById('sleepOffTime');
+    const sleepStatusEl  = document.getElementById('sleepStatus');
     let lastFrame = -1;
     let settingTimer = 0;
     let activeControl = null;
@@ -885,6 +970,20 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
         metric('Largest PSRAM Block', kb(s.hardware.psramLargest)),
         metric('Flash / CPU', `${kb(s.hardware.flashSize)} / ${s.hardware.cpuMhz} MHz`)
       ].join('');
+
+      if (s.sleep) {
+        const sl = s.sleep;
+        if (document.activeElement !== sleepEnabledEl) sleepEnabledEl.checked = sl.enabled;
+        if (document.activeElement !== sleepOnEl)  sleepOnEl.value  = sl.onTime  || '';
+        if (document.activeElement !== sleepOffEl) sleepOffEl.value = sl.offTime || '';
+        const stateColor = { awake:'var(--accent2)', pending:'var(--warn)', dark:'var(--muted)', woken:'var(--warn)' };
+        const stateLabel = { awake:'awake', pending:'sleeping soon…', dark:'display off', woken:'touch-woken' };
+        sleepStatusEl.innerHTML =
+          'State: <span style="color:' + (stateColor[sl.state]||'inherit') + '">' + (stateLabel[sl.state]||sl.state) + '</span>'
+          + (sl.inWindow ? ' &middot; <span style="color:var(--warn)">In window</span>' : '')
+          + (sl.state === 'woken' && sl.wakeRemainSecs > 0 ? ' &middot; Re-sleep in ' + sl.wakeRemainSecs + 's' : '')
+          + '<br>Window: ' + (sl.enabled ? sl.onTime + '–' + sl.offTime : '<em>disabled</em>');
+      }
     }
 
     async function poll() {
@@ -974,6 +1073,10 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       text('render', 'resetting WiFi');
     });
 
+    sleepEnabledEl.addEventListener('change', () => setConfig({ sleepEnabled: sleepEnabledEl.checked }));
+    sleepOnEl.addEventListener('change',  () => setConfig({ sleepOnTime:  sleepOnEl.value }));
+    sleepOffEl.addEventListener('change', () => setConfig({ sleepOffTime: sleepOffEl.value }));
+
     poll();
     setInterval(poll, 1000);
   </script>
@@ -1043,8 +1146,26 @@ void handleWebTouch() {
     return;
   }
 
+  if (sleepPhase == SLEEP_DARK) {
+    setBacklightBrightness(brightnessLevel);
+    exitSleepRestoreDashboard();
+    sleepPhase   = SLEEP_TOUCH_WOKEN;
+    sleepPhaseMs = millis();
+    DBG_INFO("Sleep: woken via WebUI touch");
+    webServer.send(200, "application/json", "{\"ok\":true,\"woke\":true}");
+    return;
+  }
+
   bool handled = handleUiTouch(tx, ty, true);
   webServer.send(200, "application/json", String("{\"ok\":") + (handled ? "true" : "false") + "}");
+}
+
+static bool parseHHMM(const String& s, int& h, int& m) {
+  int colon = s.indexOf(':');
+  if (colon < 1 || colon >= (int)s.length() - 1) return false;
+  h = s.substring(0, colon).toInt();
+  m = s.substring(colon + 1).toInt();
+  return h >= 0 && h <= 23 && m >= 0 && m <= 59;
 }
 
 void handleWebConfig() {
@@ -1053,7 +1174,7 @@ void handleWebConfig() {
     return;
   }
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, webServer.arg("plain"));
   if (err) {
     webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid json\"}");
@@ -1126,6 +1247,36 @@ void handleWebConfig() {
              layerNames[layerStyle], overlayAlphaPercent[layerStyle]);
     layerCycleLastMs = millis();
     triggerRenderForLayer(layerStyle, true);
+  }
+
+  if (doc.containsKey("sleepEnabled")) {
+    bool requested = doc["sleepEnabled"].as<bool>();
+    if (requested != sleepScheduleEnabled) {
+      sleepScheduleEnabled = requested;
+      saveSleepSettings();
+      changed = true;
+      DBG_INFO("Sleep schedule %s", sleepScheduleEnabled ? "enabled" : "disabled");
+    }
+  }
+
+  if (doc.containsKey("sleepOnTime")) {
+    int h, m;
+    if (parseHHMM(doc["sleepOnTime"].as<String>(), h, m)) {
+      sleepOnHour   = h;
+      sleepOnMinute = m;
+      saveSleepSettings();
+      changed = true;
+    }
+  }
+
+  if (doc.containsKey("sleepOffTime")) {
+    int h, m;
+    if (parseHHMM(doc["sleepOffTime"].as<String>(), h, m)) {
+      sleepOffHour   = h;
+      sleepOffMinute = m;
+      saveSleepSettings();
+      changed = true;
+    }
   }
 
   webServer.send(200, "application/json", String("{\"ok\":true,\"changed\":") + (changed ? "true" : "false") + "}");
@@ -2630,6 +2781,132 @@ bool handleUiTouch(int tx, int ty, bool debounce) {
   return handled;
 }
 
+// ---------------------------------------------------------------------------
+// Sleep schedule helpers
+// ---------------------------------------------------------------------------
+
+void loadSleepSettings() {
+  prefs.begin("sleepsch", true);
+  sleepScheduleEnabled  = prefs.getBool("enabled",  cfg::kSleepScheduleEnabled);
+  sleepOnHour           = prefs.getInt("onHour",    cfg::kSleepOnHour);
+  sleepOnMinute         = prefs.getInt("onMin",     cfg::kSleepOnMinute);
+  sleepOffHour          = prefs.getInt("offHour",   cfg::kSleepOffHour);
+  sleepOffMinute        = prefs.getInt("offMin",    cfg::kSleepOffMinute);
+  sleepWakeDurationSecs = prefs.getInt("wakeSecs",  cfg::kSleepWakeDurationSecs);
+  prefs.end();
+  DBG_INFO("Sleep settings loaded | enabled=%d on=%02d:%02d off=%02d:%02d wake=%ds",
+           sleepScheduleEnabled, sleepOnHour, sleepOnMinute,
+           sleepOffHour, sleepOffMinute, sleepWakeDurationSecs);
+}
+
+void saveSleepSettings() {
+  prefs.begin("sleepsch", false);
+  prefs.putBool("enabled",  sleepScheduleEnabled);
+  prefs.putInt("onHour",    sleepOnHour);
+  prefs.putInt("onMin",     sleepOnMinute);
+  prefs.putInt("offHour",   sleepOffHour);
+  prefs.putInt("offMin",    sleepOffMinute);
+  prefs.putInt("wakeSecs",  sleepWakeDurationSecs);
+  prefs.end();
+}
+
+bool isInSleepWindow() {
+  struct tm ti;
+  if (!getLocalTime(&ti)) return false;
+  int nowMins = ti.tm_hour * 60 + ti.tm_min;
+  int onMins  = sleepOnHour  * 60 + sleepOnMinute;
+  int offMins = sleepOffHour * 60 + sleepOffMinute;
+  if (onMins >= offMins) {
+    return nowMins >= onMins || nowMins < offMins;  // window crosses midnight
+  }
+  return nowMins >= onMins && nowMins < offMins;    // same-day window
+}
+
+void drawSleepScreen() {
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextColor(lcd.color565(40, 40, 40));
+  lcd.setTextSize(2);
+  lcd.setTextDatum(middle_center);
+  lcd.drawString("In Sleep mode", cfg::kScreenWidth / 2, cfg::kScreenHeight / 2 - 16);
+  lcd.drawString("touch to wake up", cfg::kScreenWidth / 2, cfg::kScreenHeight / 2 + 16);
+  markScreenUpdated();
+}
+
+void exitSleepRestoreDashboard() {
+  appState = 0;
+  if (firstRenderDone && mapFront) {
+    lcd.fillScreen(TFT_BLACK);
+    mapFront->pushSprite(0, 0);
+    drawMapBadges();
+    drawTopDate();
+    drawBottomDashboard();
+    drawSideButtons();
+    drawSignature();
+    drawProgressTimer();
+  }
+  markScreenUpdated();
+}
+
+void pollSleepSchedule() {
+  if (!firstRenderDone) return;
+
+  if (!sleepScheduleEnabled) {
+    if (sleepPhase != SLEEP_AWAKE) {
+      if (sleepPhase == SLEEP_DARK) setBacklightBrightness(brightnessLevel);
+      exitSleepRestoreDashboard();
+      sleepPhase = SLEEP_AWAKE;
+    }
+    return;
+  }
+
+  bool inWindow = isInSleepWindow();
+  unsigned long now = millis();
+
+  switch (sleepPhase) {
+    case SLEEP_AWAKE:
+      if (inWindow) {
+        drawSleepScreen();
+        sleepPhase   = SLEEP_PENDING;
+        sleepPhaseMs = now;
+        DBG_INFO("Sleep: pending (showing message, BL off in 2s)");
+      }
+      break;
+
+    case SLEEP_PENDING:
+      if (!inWindow) {
+        exitSleepRestoreDashboard();
+        sleepPhase = SLEEP_AWAKE;
+      } else if (now - sleepPhaseMs >= 2000) {
+        setBacklightBrightness(0);
+        sleepPhase = SLEEP_DARK;
+        DBG_INFO("Sleep: backlight off");
+      }
+      break;
+
+    case SLEEP_DARK:
+      if (!inWindow) {
+        setBacklightBrightness(brightnessLevel);
+        exitSleepRestoreDashboard();
+        sleepPhase = SLEEP_AWAKE;
+        DBG_INFO("Sleep: window ended, waking");
+      }
+      // Physical touch wakes handled in loop(); WebUI touch in handleWebTouch().
+      break;
+
+    case SLEEP_TOUCH_WOKEN:
+      if (!inWindow) {
+        sleepPhase   = SLEEP_AWAKE;
+        sleepPhaseMs = 0;
+      } else if (now - sleepPhaseMs >= (unsigned long)sleepWakeDurationSecs * 1000UL) {
+        drawSleepScreen();
+        sleepPhase   = SLEEP_PENDING;
+        sleepPhaseMs = now;
+        DBG_INFO("Sleep: touch-wake timeout, re-entering pending");
+      }
+      break;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -2647,6 +2924,8 @@ void setup() {
   lcd.setTextDatum(middle_center);
   lcd.drawString("Connecting...", 400, 240);
   markScreenUpdated();
+
+  loadSleepSettings();
 
   bool wifiOk = initWiFi();
   String ip = "";
@@ -2711,6 +2990,7 @@ void setup() {
 
 void loop() {
   static unsigned long lT = 0;
+  static unsigned long lastSleepCheckMs = 0;
   struct tm ti;
 
   handleWebUiClient();
@@ -2725,17 +3005,19 @@ void loop() {
 
   // --- Flip completed background render to screen ---
   if (renderState == RENDER_READY) {
-    renderState = RENDER_IDLE;
-    lcd.fillScreen(TFT_BLACK);
-    mapFront->pushSprite(0, 0);
-    drawMapBadges();
+    renderState    = RENDER_IDLE;
     firstRenderDone = true;
-    drawTopDate();
-    drawBottomDashboard();
-    drawSideButtons();
-    drawSignature();
-    drawProgressTimer();
-    markScreenUpdated();
+    if (sleepPhase == SLEEP_AWAKE || sleepPhase == SLEEP_TOUCH_WOKEN) {
+      lcd.fillScreen(TFT_BLACK);
+      mapFront->pushSprite(0, 0);
+      drawMapBadges();
+      drawTopDate();
+      drawBottomDashboard();
+      drawSideButtons();
+      drawSignature();
+      drawProgressTimer();
+      markScreenUpdated();
+    }
     if (renderPending) {
       int queuedLayer = pendingLayerStyle;
       bool queuedForce = pendingRenderForce;
@@ -2749,6 +3031,26 @@ void loop() {
     updateLoadingProgress();
     pollRenderWatchdog();
     delay(10);  // yield to RenderTask while the startup screen is waiting
+    return;
+  }
+
+  // --- Night sleep schedule (check once per second) ---
+  if (millis() - lastSleepCheckMs >= 1000) {
+    lastSleepCheckMs = millis();
+    pollSleepSchedule();
+  }
+
+  // The rest of loop() only runs when the display is showing normally.
+  if (sleepPhase == SLEEP_DARK || sleepPhase == SLEEP_PENDING) {
+    // Only handle touch to wake when the display is off.
+    if (sleepPhase == SLEEP_DARK && touch_has_signal() && touch_touched()) {
+      setBacklightBrightness(brightnessLevel);
+      exitSleepRestoreDashboard();
+      sleepPhase   = SLEEP_TOUCH_WOKEN;
+      sleepPhaseMs = millis();
+      DBG_INFO("Sleep: woken by touch | re-sleep in %ds", sleepWakeDurationSecs);
+      delay(200);
+    }
     return;
   }
 
