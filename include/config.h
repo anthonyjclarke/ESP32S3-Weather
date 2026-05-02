@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-#define FW_VERSION "1.0.0"
+constexpr const char* kFwVersion = "1.4.0";
 
 namespace cfg {
 
@@ -12,16 +12,48 @@ constexpr int kScreenHeight = 480;
 // Location settings:
 // 1. Set kLocationName to the label you want to use for this dashboard.
 // 2. Set latitude/longitude in decimal degrees. South is negative, east is positive.
-// 3. kMapZoom controls the startup map zoom; 5-7 is the intended touch-cycle range.
+// 3. kMapZoom controls the startup zoom. kMapZoomMin/kMapZoomMax set the touch-cycle
+//    range. Radar and OWM overlay tiles are only available up to zoom 12; above that
+//    the base map still works but overlays will not load.
 // 4. kDefaultMapStyle selects startup map base: 0 = dark, 1 = topo, 2 = OSM.
 // 5. The base-map contrast/brightness values tune tile visibility on the LCD.
+
 constexpr const char* kLocationName = "Putney, NSW, Australia";
 constexpr double kLocationLatitude  = -33.8261;
 constexpr double kLocationLongitude = 151.1063;
-constexpr int kMapZoom = 6;
+constexpr int kMapZoom    = 7;
+constexpr int kMapZoomMin = 5;   // minimum touch-cycle zoom
+constexpr int kMapZoomMax = 12;  // maximum touch-cycle zoom (overlay tiles top out here)
 constexpr int kDefaultMapStyle = 1;          // 0 = dark, 1 = topo, 2 = OSM
 constexpr int kBaseMapContrastPercent = 125; // 100 = unchanged
 constexpr int kBaseMapBrightness = 18;       // -255 to 255, applied after contrast
+constexpr int kRadarOverlayAlphaPercent = 55; // 0 = invisible, 100 = opaque
+constexpr int kCloudOverlayAlphaPercent = 25; // 0 = invisible, 100 = opaque
+constexpr int kRainOverlayAlphaPercent  = 25; // 0 = invisible, 100 = opaque
+
+constexpr const char* kWifiApName  = "ESP32S3-Weather";
+constexpr const char* kOtaHostname = "ESP32S3-Weather";
+constexpr const char* kNtpTimezone = "AEST-10AEDT,M10.1.0,M4.1.0/3";
+constexpr int         kLayerCycleSecs = 30;
+constexpr int         kRealtimeRefreshSecs = 1800; // weather/map API refresh interval
+constexpr uint32_t    kRenderTaskStackBytes = 32768;
+constexpr UBaseType_t kRenderTaskPriority = 1;
+constexpr uint32_t    kRenderStallWarnMs = 10000;
+constexpr uint32_t    kRenderStallRepeatMs = 10000;
+
+// Night sleep schedule:
+// kSleepScheduleEnabled: master on/off (default off — enable via WebUI or set true here).
+// kSleepOnHour / kSleepOnMinute: sleep-start time (display turns off). Window may cross
+//   midnight (e.g. 22:00–07:00).
+// kSleepOffHour / kSleepOffMinute: wake time (display turns back on).
+// kSleepWakeDurationSecs: how long to stay awake after a touch during the sleep window.
+// All values are overridden by NVS once saved from the WebUI.
+constexpr bool kSleepScheduleEnabled  = false;
+constexpr int  kSleepOnHour           = 22;
+constexpr int  kSleepOnMinute         = 0;
+constexpr int  kSleepOffHour          = 7;
+constexpr int  kSleepOffMinute        = 0;
+constexpr int  kSleepWakeDurationSecs = 300;
 
 constexpr int kPinD0  = 14;
 constexpr int kPinD1  = 38;
@@ -62,6 +94,3 @@ constexpr uint8_t CH422G_LCD_RST = 3;
 constexpr bool TOUCH_SWAP_XY  = false;
 constexpr bool TOUCH_INVERT_X = false;
 constexpr bool TOUCH_INVERT_Y = false;
-
-#define WIFI_AP_NAME "ESP32S3-Weather"
-#define NTP_TIMEZONE "AEST-10AEDT,M10.1.0,M4.1.0/3"
