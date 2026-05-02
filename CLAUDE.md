@@ -1,6 +1,6 @@
 # CLAUDE.md — ESP32S3-Weather
 
-**Firmware version: 1.4.0**
+**Firmware version: 1.5.0**
 
 ## Target Hardware
 
@@ -34,7 +34,7 @@ CH422G expander logical pins:
 
 ## Known Hardware Quirks
 
-- **Backlight is digital on/off only.** `setBacklightBrightness()` in `src/display_hw.cpp` drives the CH422G GPIO as 0/1 — there is no PWM path. The on-screen brightness slider stores a value but has no hardware effect beyond panel on/off. PWM dimming would require hardware modification or a different expander pin routing.
+- **Backlight is digital on/off by default.** `setBacklightBrightness()` drives the CH422G GPIO as 0/1. Uncomment `#define CFG_BACKLIGHT_PWM_ENABLED` in `config.h` to enable software PWM (100 Hz FreeRTOS task). When active, `setBacklightDim(0–255)` provides proportional control used by the sleep schedule. See `docs/backlight_dimming_research.md`.
 - **PSRAM is required.** Four 800×415 sprites (`renderScratch`, `cacheRadar`, `cacheClouds`, `cacheRain`) live in PSRAM. `BOARD_HAS_PSRAM` must be set (it is, via build flags).
 - **`--no-stub` is required for upload.** The pioarduino platform used here requires this flag; removing it will cause upload failure.
 - **OTA auth is a placeholder.** `[env:esp32s3-7inch-ota]` has `--auth=change-me` — update before deploying OTA.
@@ -176,14 +176,15 @@ All pages: auto-scaled Y axis, weekend background shading (Saturday blue / Sunda
 |:-----|:--------|
 | `src/main.cpp` | All UI rendering, HTTP fetch, touch dispatch, weather/radar logic (~3100 lines) |
 | `include/waveshare_display.h` | LovyanGFX device class — RGB bus and panel config |
-| `include/display_hw.h` / `src/display_hw.cpp` | CH422G init, backlight on/off, touch reset sequence |
-| `include/touch.h` / `src/touch.cpp` | GT911 I2C driver — poll-based, no interrupt |
+| `include/display_hw.h` / `src/display_hw.cpp` | CH422G init, backlight control, PWM task + Wire mutex (when `CFG_BACKLIGHT_PWM_ENABLED`) |
+| `include/touch.h` / `src/touch.cpp` | GT911 I2C driver — poll-based, Wire mutex-guarded when PWM enabled |
 | `include/config.h` | All user-tuneable constants and pin definitions (`cfg::` namespace) |
 | `include/debug.h` | Leveled `DBG_ERROR` / `DBG_WARN` / `DBG_INFO` / `DBG_VERBOSE` macros |
 | `include/secrets.h` | Gitignored — WiFi credentials + OWM API key |
 | `include/secrets.example.h` | Template for `secrets.h` |
 | `ENHANCEMENTS.md` | Proposed base-map cache separation optimization (tracked, not yet implemented) |
 | `docs/weather_dashboard_functional_description.md` | Functional description of the dashboard |
+| `docs/backlight_dimming_research.md` | Backlight PWM option analysis (Options 1–3); implementation notes |
 
 ## User-Tuneable Settings (`include/config.h`)
 
@@ -217,9 +218,13 @@ cfg::kSleepOnMinute          // sleep-start minute (default 0)
 cfg::kSleepOffHour           // wake hour (default 7)
 cfg::kSleepOffMinute         // wake minute (default 0)
 cfg::kSleepWakeDurationSecs  // touch-wake stay-awake duration (default 300 s)
+cfg::kSleepDimBrightness     // sleep dim level 0–255 (default 30 ≈ 12%); CFG_BACKLIGHT_PWM_ENABLED only
+cfg::kSleepDimTestMode       // true = dim immediately on boot to verify level; CFG_BACKLIGHT_PWM_ENABLED only
 ```
 
 All sleep settings are persisted in NVS and overridden via the WebUI Night Schedule card. Config.h values serve as factory defaults only.
+
+`CFG_BACKLIGHT_PWM_ENABLED` is a `#define` (not a `constexpr`) in `config.h`. Comment/uncomment to toggle the entire PWM feature at compile time.
 
 Overlay alpha values can also be updated at runtime via the WebUI `/api/config` endpoint — changes take effect on next render.
 

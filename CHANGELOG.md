@@ -15,6 +15,33 @@
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
 
+## [1.5.0] 2026-05-03
+
+### Added
+
+- Software PWM backlight dimming via CH422G I2C, controlled by feature flag
+  `CFG_BACKLIGHT_PWM_ENABLED` in `config.h`. Disabled by default — the build
+  retains original digital on/off behaviour until the flag is uncommented.
+- When enabled, a FreeRTOS task (`bl_pwm`, Core 0, priority 2) drives the
+  backlight at 100 Hz with proportional duty cycle. At 0 and 255 the pin is
+  held steady with no toggling.
+- `setBacklightDim(uint8_t)` — new function for proportional brightness
+  (0=off, 255=full, 1–254 = ~10% duty steps). Distinct from
+  `setBacklightBrightness()` which retains on/off semantics.
+- `startBacklightPwm()` — call once from `setup()` after `touch_init()`. Wires
+  up the mutex and spawns the task.
+- `gWireMutex` — `SemaphoreHandle_t` protecting the shared I2C bus between the
+  PWM task (Core 0) and GT911 touch polling (Core 1). Active only when flag is
+  set; zero overhead otherwise.
+- `kSleepDimBrightness` (default 30/255 ≈ 12%) — configurable sleep dim level.
+- `kSleepDimTestMode` (default false) — when true, immediately dims to
+  `kSleepDimBrightness` after boot so the level can be evaluated without waiting
+  for the sleep window.
+- Sleep state machine updated: when `CFG_BACKLIGHT_PWM_ENABLED` is set, the
+  `SLEEP_PENDING → SLEEP_DARK` transition calls `setBacklightDim()` instead of
+  turning off. All wake paths continue to use `setBacklightBrightness()` and
+  restore full brightness unchanged.
+
 ## [1.4.0] 2026-05-02
 
 ### Added

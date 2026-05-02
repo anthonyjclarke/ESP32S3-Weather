@@ -2877,9 +2877,14 @@ void pollSleepSchedule() {
         exitSleepRestoreDashboard();
         sleepPhase = SLEEP_AWAKE;
       } else if (now - sleepPhaseMs >= 2000) {
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+        setBacklightDim(cfg::kSleepDimBrightness);
+        DBG_INFO("Sleep: backlight dimmed to %u/255", (unsigned)cfg::kSleepDimBrightness);
+#else
         setBacklightBrightness(0);
-        sleepPhase = SLEEP_DARK;
         DBG_INFO("Sleep: backlight off");
+#endif
+        sleepPhase = SLEEP_DARK;
       }
       break;
 
@@ -2916,6 +2921,9 @@ void setup() {
   lcd.setRotation(0);
   lcd.setColorDepth(16);
   touch_init();
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  startBacklightPwm();
+#endif
   setBacklightBrightness(brightnessLevel);
 
   lcd.fillScreen(TFT_BLACK);
@@ -2984,6 +2992,15 @@ void setup() {
   realtimeRefreshLastMs = millis();
   lastUpdate = realtimeRefreshLastMs;
   triggerRenderForLayer(layerStyle, false);
+
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  if (cfg::kSleepDimTestMode) {
+    setBacklightDim(cfg::kSleepDimBrightness);
+    DBG_INFO("BL PWM test mode: dim to %u/255 (~%u%%)",
+             (unsigned)cfg::kSleepDimBrightness,
+             (unsigned)(cfg::kSleepDimBrightness * 100u / 255u));
+  }
+#endif
 
   logStartupBanner(wifiOk, ip.c_str());
 }

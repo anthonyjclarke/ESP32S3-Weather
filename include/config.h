@@ -55,6 +55,30 @@ constexpr int  kSleepOffHour          = 7;
 constexpr int  kSleepOffMinute        = 0;
 constexpr int  kSleepWakeDurationSecs = 300;
 
+// --- Backlight software PWM dimming (Option 1 — FreeRTOS task via CH422G I2C) ---
+//
+// Uncomment the #define below to enable. When disabled the build retains the original
+// digital on/off behaviour with zero overhead — no task, no mutex, no code change.
+//
+// When enabled:
+//   - setBacklightBrightness() preserves its existing on/off semantics (0=off, >0=full on).
+//   - setBacklightDim() drives proportional PWM at 100 Hz (0=off, 255=full, 1–254=dim).
+//   - The sleep state machine calls setBacklightDim(kSleepDimBrightness) instead of off.
+//   - A Wire mutex guards I2C access between the PWM task (Core 0) and touch (Core 1).
+//
+// To remove entirely: comment out the #define. All other code paths revert automatically.
+//
+// #define CFG_BACKLIGHT_PWM_ENABLED
+
+// Brightness during sleep window (0–255). Only used when CFG_BACKLIGHT_PWM_ENABLED is set.
+// 30 ≈ 12% duty — visible but not intrusive in a dark room. Adjust to taste.
+constexpr uint8_t kSleepDimBrightness = 30;
+
+// When true, setBacklightDim(kSleepDimBrightness) is called immediately after
+// startBacklightPwm() in setup() so the dim level is visible without waiting for the
+// sleep window. Set false for normal operation. Only active when CFG_BACKLIGHT_PWM_ENABLED.
+constexpr bool kSleepDimTestMode = false;
+
 constexpr int kPinD0  = 14;
 constexpr int kPinD1  = 38;
 constexpr int kPinD2  = 18;
