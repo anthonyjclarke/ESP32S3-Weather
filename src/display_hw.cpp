@@ -34,30 +34,33 @@ static TaskHandle_t     sPwmTask       = nullptr;
 // 100 Hz PWM task running on Core 0. Holds pin steady at 0 or 1 when brightness
 // is 0 or 255 respectively; otherwise toggles at 100 Hz with proportional duty.
 static void backlightPwmTask(void*) {
-  uint8_t lastB = 255;
+  uint8_t lastSteadyB = 0;
+  bool steadyApplied = false;
 
   while (true) {
     uint8_t b = sPwmBrightness;
 
     if (b == 0) {
-      if (lastB != 0) {
+      if (!steadyApplied || lastSteadyB != 0) {
         if (xSemaphoreTake(gWireMutex, portMAX_DELAY)) {
           ch422gSetPin(CH422G_LCD_BL, 0);
           xSemaphoreGive(gWireMutex);
         }
-        lastB = 0;
+        lastSteadyB = 0;
+        steadyApplied = true;
       }
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
 
     if (b == 255) {
-      if (lastB != 255) {
+      if (!steadyApplied || lastSteadyB != 255) {
         if (xSemaphoreTake(gWireMutex, portMAX_DELAY)) {
           ch422gSetPin(CH422G_LCD_BL, 1);
           xSemaphoreGive(gWireMutex);
         }
-        lastB = 255;
+        lastSteadyB = 255;
+        steadyApplied = true;
       }
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
@@ -65,9 +68,12 @@ static void backlightPwmTask(void*) {
 
     // Proportional PWM: 10 ms period (100 Hz), 1 ms tick resolution.
     // Effective duty steps: 10%, 20%, …, 90%. Fine enough for night dimming.
-    lastB = b;
-    uint32_t onMs  = max(1u, (uint32_t)(10u * b / 255u));
-    uint32_t offMs = max(1u, 10u - onMs);
+    steadyApplied = false;
+    constexpr uint32_t kPeriodMs = 10;
+    uint32_t onMs = (kPeriodMs * b + 127u) / 255u;
+    if (onMs < 1) onMs = 1;
+    if (onMs >= kPeriodMs) onMs = kPeriodMs - 1;
+    uint32_t offMs = kPeriodMs - onMs;
 
     if (xSemaphoreTake(gWireMutex, portMAX_DELAY)) {
       ch422gSetPin(CH422G_LCD_BL, 1);
@@ -118,8 +124,8 @@ void initBoardHardware(uint8_t brightness) {
 
 void setBacklightBrightness(uint8_t brightness) {
 #ifdef CFG_BACKLIGHT_PWM_ENABLED
-  // Preserve original on/off semantics. The PWM task holds the pin steady at
-  // the corresponding state; no toggling occurs when at 0 or 255.
+  // Normal display brightness is steady on/off on this CH422G-controlled board.
+  // Software PWM is reserved for explicit sleep dimming via setBacklightDim().
   sPwmBrightness = (brightness > 0) ? 255 : 0;
 #else
   ch422gSetPin(CH422G_LCD_BL, brightness > 0 ? 1 : 0);

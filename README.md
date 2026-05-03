@@ -200,8 +200,9 @@ forced, or no longer matches the active map style or zoom.
 ## Notes
 
 The Waveshare board backlight is controlled through the CH422G expander as a
-digital enable. The on-screen brightness slider therefore behaves as an on/off
-backlight control on this hardware.
+digital enable. The normal brightness control is therefore steady on/off; when
+`CFG_BACKLIGHT_PWM_ENABLED` is enabled, firmware software-PWMs that CH422G output
+only for explicit sleep dimming.
 
 ## Reference Docs
 

@@ -15,6 +15,28 @@
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
 
+## [1.5.1] 2026-05-03
+
+### Added
+
+- TFT map-style badge now includes the active zoom level, e.g. `TOPO Zoom 7`,
+  for every base map style.
+- WebUI Night Schedule card: **Sleep dim** slider for `kSleepDimBrightness`.
+  The value is persisted in NVS and applies immediately while sleep mode is dark.
+- WebUI Night Schedule card: **Force sleep now** toggle. Activates sleep mode immediately regardless of the schedule window — useful for testing PWM dimming and for manual override outside normal sleep hours. Cleared automatically on toggle-off; not persisted to NVS.
+
+### Fixed
+
+- `display_hw.cpp`: full-on PWM could skip the initial CH422G pin-high write
+  because the PWM task started with `lastB = 255`; steady 0/255 states now
+  force their first write.
+- `setBacklightBrightness()` stays steady on/off when `CFG_BACKLIGHT_PWM_ENABLED`
+  is active. Software PWM is reserved for `setBacklightDim()` so the awake TFT
+  backlight does not flicker.
+- `display_hw.cpp`: `std::max()` type-deduction error (`unsigned int` vs `uint32_t`) on toolchain GCC 14 — both arguments now explicitly cast to `uint32_t`.
+- `setup()`: init-order crash when `CFG_BACKLIGHT_PWM_ENABLED` is active — `touch_init()` was called before `startBacklightPwm()`, so `gWireMutex` was `nullptr` when `WIRE_TAKE()` fired inside `gt911ReadBytes()`. `startBacklightPwm()` (mutex creation + task start) now runs before `touch_init()`.
+- `renderTaskFn`: stale render displayed when zoom or map style changed mid-render — the in-flight render at the old settings would re-validate the layer cache (overwriting the `invalidateLayerCaches()` that zoom-change triggers) and update `mapFront` to the wrong-zoom sprite. Render result is now discarded if `renderZoom != myZoom || renderMapStyle != mapStyle` at completion; Core 0 re-triggers via `renderPending`.
+
 ## [1.5.0] 2026-05-03
 
 ### Added

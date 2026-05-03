@@ -12,9 +12,11 @@ void setBacklightBrightness(uint8_t brightness);
 // Mutex protecting the shared Wire bus between the PWM task (Core 0) and
 // touch polling (Core 1). Taken automatically by both paths when PWM is enabled.
 extern SemaphoreHandle_t gWireMutex;
-// Start the 100 Hz PWM FreeRTOS task. Call once at end of setup(), after touch_init().
+// Start the 100 Hz PWM FreeRTOS task. Must be called BEFORE touch_init() — touch
+// polling takes gWireMutex, so the mutex must exist first.
 void startBacklightPwm();
 // Set backlight to a proportional brightness (0=off, 255=full, 1–254=PWM dim).
-// Unlike setBacklightBrightness(), this uses actual duty-cycle control.
+// Use only where dimming is explicitly wanted; normal brightness remains steady
+// on/off through setBacklightBrightness().
 void setBacklightDim(uint8_t brightness);
 #endif
