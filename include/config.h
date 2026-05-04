@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-constexpr const char* kFwVersion = "1.4.0";
+constexpr const char* kFwVersion = "1.5.2";
 
 namespace cfg {
 
@@ -27,9 +27,9 @@ constexpr int kMapZoomMax = 12;  // maximum touch-cycle zoom (overlay tiles top 
 constexpr int kDefaultMapStyle = 1;          // 0 = dark, 1 = topo, 2 = OSM
 constexpr int kBaseMapContrastPercent = 125; // 100 = unchanged
 constexpr int kBaseMapBrightness = 18;       // -255 to 255, applied after contrast
-constexpr int kRadarOverlayAlphaPercent = 55; // 0 = invisible, 100 = opaque
-constexpr int kCloudOverlayAlphaPercent = 25; // 0 = invisible, 100 = opaque
-constexpr int kRainOverlayAlphaPercent  = 25; // 0 = invisible, 100 = opaque
+constexpr int kRadarOverlayAlphaPercent = 50; // 0 = invisible, 100 = opaque
+constexpr int kCloudOverlayAlphaPercent = 50; // 0 = invisible, 100 = opaque
+constexpr int kRainOverlayAlphaPercent  = 50; // 0 = invisible, 100 = opaque
 
 constexpr const char* kWifiApName  = "ESP32S3-Weather";
 constexpr const char* kOtaHostname = "ESP32S3-Weather";
@@ -48,6 +48,7 @@ constexpr uint32_t    kRenderStallRepeatMs = 10000;
 // kSleepOffHour / kSleepOffMinute: wake time (display turns back on).
 // kSleepWakeDurationSecs: how long to stay awake after a touch during the sleep window.
 // All values are overridden by NVS once saved from the WebUI.
+
 constexpr bool kSleepScheduleEnabled  = false;
 constexpr int  kSleepOnHour           = 22;
 constexpr int  kSleepOnMinute         = 0;
@@ -72,11 +73,13 @@ constexpr int  kSleepWakeDurationSecs = 300;
 
 // Brightness during sleep window (0–255). Only used when CFG_BACKLIGHT_PWM_ENABLED is set.
 // 30 ≈ 12% duty — visible but not intrusive in a dark room. Adjust to taste.
+
 constexpr uint8_t kSleepDimBrightness = 70;
 
 // When true, setBacklightDim(kSleepDimBrightness) is called immediately after
 // startBacklightPwm() in setup() so the dim level is visible without waiting for the
 // sleep window. Set false for normal operation. Only active when CFG_BACKLIGHT_PWM_ENABLED.
+
 constexpr bool kSleepDimTestMode = false;
 
 constexpr int kPinD0  = 14;

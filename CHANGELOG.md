@@ -1,7 +1,8 @@
 # Changelog
 
 ## Todo
-- Stop screen Glitching
+- Add TZ selection in WebUI
+- Tidy up Social status line in WebUI
 - Evaluate free-to-use API alternatives based on current usage in the README
   `## API` section. Keep Open-Meteo as the forecast baseline if
   non-commercial limits fit the project; compare OpenFreeMap or self-hosted
@@ -14,6 +15,31 @@
 - Based on Zoom if data not available then skip display with a status message to advise
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
+
+## [1.5.2] 04-05-2026
+
+### Added
+
+- Overlay opacity settings (Radar, Clouds, Rain) now persisted to NVS under
+  the `"overlays"` Preferences namespace, keys `radar`, `clouds`, `rain`.
+  Values are loaded at boot and saved immediately on any WebUI change.
+  Default changed to 50% for all three layers (was 55/25/25).
+
+### Changed
+
+- WebUI Night Schedule: **Sleep dim** control renamed to **Display Brightness**.
+- Removed the WebUI Brightness slider and all associated code. The CH422G
+  backlight is digital on/off at full brightness; the slider had no effect
+  beyond toggling on/off and was misleading. Brightness during the sleep window
+  is still controlled by the Display Brightness slider in Night Schedule.
+- Removed left-edge touch brightness zone on the physical display (drag-to-dim
+  gesture), and the yellow brightness-level marker from the progress-timer bar,
+  for the same reason.
+
+### Fixed
+
+- Startup TFT version string now matches `kFwVersion` in `config.h`. Was
+  displaying `1.4.0` (stale value) despite subsequent version bumps.
 
 ## [1.5.1] 2026-05-03
 

@@ -37,7 +37,6 @@ unsigned long lastUpdate = 0;
 long radarTS = 0;
 int appState = 0;
 int lastMinute = -1;
-int brightnessLevel = 100;
 int mapStyle = cfg::kDefaultMapStyle;   // 0 = dark_all, 1 = opentopomap, 2 = openstreetmap
 int layerStyle = 0; // 0 = Radar, 1 = Clouds, 2 = Rain
 bool owmAuthFailed = false;
@@ -136,7 +135,6 @@ float dMax[16], dMin[16], dRain[16], dPress[16], dCloud[16];
 float dHum[16], dWind[16], dUV[16], dSolar[16];
 int dCode[16];
 
-void setBrightnessFromTouchY(int ty);
 void getWeatherData();
 void renderRadarMap();
 void triggerRenderForLayer(int targetLayer, bool forceRefresh = false);
@@ -157,6 +155,8 @@ void markScreenUpdated();
 void setupWebUi(bool wifiOk);
 void handleWebUiClient();
 bool handleUiTouch(int tx, int ty, bool debounce);
+void loadOverlaySettings();
+void saveOverlaySettings();
 void loadSleepSettings();
 void saveSleepSettings();
 bool isInSleepWindow();
@@ -644,7 +644,6 @@ String buildStatusJson() {
   json += ",\"renderTilesTotal\":" + String((int)renderTilesTotal);
   json += ",\"lastUpdateAgeSec\":" + String((millis() - lastUpdate) / 1000UL);
   json += ",\"refreshSec\":" + String(cfg::kRealtimeRefreshSecs);
-  json += ",\"brightness\":" + String(brightnessLevel);
   json += ",\"overlayAlpha\":{";
   json += "\"radar\":" + String(overlayAlphaPercent[0]);
   json += ",\"clouds\":" + String(overlayAlphaPercent[1]);
@@ -854,24 +853,19 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <output id="zoomOut">7</output>
         </div>
         <div class="control">
-          <label for="brightnessControl">Brightness</label>
-          <input id="brightnessControl" type="range" min="20" max="255" step="1" value="100">
-          <output id="brightnessOut">100</output>
-        </div>
-        <div class="control">
           <label for="radarAlphaControl">Radar opacity</label>
-          <input id="radarAlphaControl" type="range" min="0" max="100" step="1" value="55">
-          <output id="radarAlphaOut">55%</output>
+          <input id="radarAlphaControl" type="range" min="0" max="100" step="1" value="50">
+          <output id="radarAlphaOut">50%</output>
         </div>
         <div class="control">
           <label for="cloudAlphaControl">Cloud opacity</label>
-          <input id="cloudAlphaControl" type="range" min="0" max="100" step="1" value="25">
-          <output id="cloudAlphaOut">25%</output>
+          <input id="cloudAlphaControl" type="range" min="0" max="100" step="1" value="50">
+          <output id="cloudAlphaOut">50%</output>
         </div>
         <div class="control">
           <label for="rainAlphaControl">Rain opacity</label>
-          <input id="rainAlphaControl" type="range" min="0" max="100" step="1" value="25">
-          <output id="rainAlphaOut">25%</output>
+          <input id="rainAlphaControl" type="range" min="0" max="100" step="1" value="50">
+          <output id="rainAlphaOut">50%</output>
         </div>
       </section>
       <section class="card">
@@ -897,7 +891,7 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <input id="sleepOffTime" type="time" class="time-input">
         </div>
         <div class="control">
-          <label for="sleepDimControl">Sleep dim</label>
+          <label for="sleepDimControl">Display Brightness</label>
           <input id="sleepDimControl" type="range" min="0" max="255" step="1" value="70">
           <output id="sleepDimOut">70</output>
         </div>
@@ -917,12 +911,10 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
   <script>
     const mirror = document.getElementById('mirror');
     const zoomControl = document.getElementById('zoomControl');
-    const brightnessControl = document.getElementById('brightnessControl');
     const radarAlphaControl = document.getElementById('radarAlphaControl');
     const cloudAlphaControl = document.getElementById('cloudAlphaControl');
     const rainAlphaControl = document.getElementById('rainAlphaControl');
     const zoomOut = document.getElementById('zoomOut');
-    const brightnessOut = document.getElementById('brightnessOut');
     const radarAlphaOut = document.getElementById('radarAlphaOut');
     const cloudAlphaOut = document.getElementById('cloudAlphaOut');
     const rainAlphaOut = document.getElementById('rainAlphaOut');
@@ -955,10 +947,6 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       if (activeControl !== 'zoom') {
         zoomControl.value = s.zoom;
         zoomOut.textContent = s.zoom;
-      }
-      if (activeControl !== 'brightness') {
-        brightnessControl.value = s.brightness;
-        brightnessOut.textContent = s.brightness;
       }
       if (s.overlayAlpha) {
         if (activeControl !== 'radarAlpha') {
@@ -1071,11 +1059,6 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       scheduleConfig('zoom', zoomControl.value);
     });
 
-    brightnessControl.addEventListener('input', () => {
-      brightnessOut.textContent = brightnessControl.value;
-      scheduleConfig('brightness', brightnessControl.value);
-    });
-
     radarAlphaControl.addEventListener('input', () => {
       radarAlphaOut.textContent = `${radarAlphaControl.value}%`;
       scheduleConfig('radarAlpha', radarAlphaControl.value);
@@ -1182,7 +1165,7 @@ void handleWebTouch() {
   }
 
   if (sleepPhase == SLEEP_DARK) {
-    setBacklightBrightness(brightnessLevel);
+    setBacklightBrightness(255);
     exitSleepRestoreDashboard();
     sleepPhase   = SLEEP_TOUCH_WOKEN;
     sleepPhaseMs = millis();
@@ -1218,14 +1201,6 @@ void handleWebConfig() {
 
   bool changed = false;
   bool currentLayerAlphaChanged = false;
-
-  if (doc.containsKey("brightness")) {
-    int requested = doc["brightness"] | brightnessLevel;
-    brightnessLevel = constrain(requested, 20, 255);
-    setBacklightBrightness(brightnessLevel);
-    if (appState == 0) drawProgressTimer();
-    changed = true;
-  }
 
   if (doc.containsKey("zoom")) {
     int requested = doc["zoom"] | myZoom;
@@ -1275,6 +1250,10 @@ void handleWebConfig() {
       currentLayerAlphaChanged = currentLayerAlphaChanged || layerStyle == 2;
       changed = true;
     }
+  }
+
+  if (doc.containsKey("radarAlpha") || doc.containsKey("cloudAlpha") || doc.containsKey("rainAlpha")) {
+    saveOverlaySettings();
   }
 
   if (currentLayerAlphaChanged) {
@@ -1341,7 +1320,7 @@ void handleWebConfig() {
         DBG_INFO("Sleep: force-sleep enabled via WebUI");
       } else {
         if (sleepPhase == SLEEP_DARK || sleepPhase == SLEEP_PENDING) {
-          setBacklightBrightness(brightnessLevel);
+          setBacklightBrightness(255);
         }
         exitSleepRestoreDashboard();
         sleepPhase   = SLEEP_AWAKE;
@@ -1580,21 +1559,6 @@ void drawSignature() {
   markScreenUpdated();
 }
 
-void setBrightnessFromTouchY(int ty) {
-  int bx = 4, by = 4, bh = 409;
-
-  if (ty < by) ty = by;
-  if (ty > by + bh) ty = by + bh;
-
-  // top of bar = dim, bottom = bright
-  brightnessLevel = map(ty, by, by + bh, 255, 20);
-
-  if (brightnessLevel < 20) brightnessLevel = 20;
-  if (brightnessLevel > 255) brightnessLevel = 255;
-
-  setBacklightBrightness(brightnessLevel);
-}
-
 static bool initWiFi() {
   WiFiManager wm;
   bool hasSaved = WiFi.SSID().length() > 0;
@@ -1707,10 +1671,6 @@ void drawProgressTimer() {
     lcd.drawFastHLine(bx + 7, (by + bh - 7) - y, bw - 14, TFT_SKYBLUE);
   }
 
-  // Brightness marker
-  int markerY = map(brightnessLevel, 255, 20, by, by + bh);
-  lcd.drawFastHLine(bx + 4, markerY, bw - 8, TFT_YELLOW);
-  lcd.drawFastHLine(bx + 4, markerY - 1, bw - 8, TFT_YELLOW);
   markScreenUpdated();
 }
 
@@ -2792,12 +2752,6 @@ void renderTaskFn(void*) {
 // ---------------------------------------------------------------------------
 
 bool handleUiTouch(int tx, int ty, bool debounce) {
-  if (appState == 0 && tx >= 0 && tx <= 32 && ty >= 4 && ty <= 413) {
-    setBrightnessFromTouchY(ty);
-    drawProgressTimer();
-    return true;
-  }
-
   if (debounce && millis() - lastUiTouchMs <= 600) return false;
 
   bool handled = false;
@@ -2867,6 +2821,24 @@ bool handleUiTouch(int tx, int ty, bool debounce) {
 // ---------------------------------------------------------------------------
 // Sleep schedule helpers
 // ---------------------------------------------------------------------------
+
+void loadOverlaySettings() {
+  prefs.begin("overlays", true);
+  overlayAlphaPercent[0] = prefs.getInt("radar",  cfg::kRadarOverlayAlphaPercent);
+  overlayAlphaPercent[1] = prefs.getInt("clouds", cfg::kCloudOverlayAlphaPercent);
+  overlayAlphaPercent[2] = prefs.getInt("rain",   cfg::kRainOverlayAlphaPercent);
+  prefs.end();
+  DBG_INFO("Overlay alpha loaded | radar=%d%% clouds=%d%% rain=%d%%",
+           overlayAlphaPercent[0], overlayAlphaPercent[1], overlayAlphaPercent[2]);
+}
+
+void saveOverlaySettings() {
+  prefs.begin("overlays", false);
+  prefs.putInt("radar",  overlayAlphaPercent[0]);
+  prefs.putInt("clouds", overlayAlphaPercent[1]);
+  prefs.putInt("rain",   overlayAlphaPercent[2]);
+  prefs.end();
+}
 
 void loadSleepSettings() {
   prefs.begin("sleepsch", true);
@@ -2938,7 +2910,7 @@ void pollSleepSchedule() {
 
   if (!sleepScheduleEnabled && !sleepForced) {
     if (sleepPhase != SLEEP_AWAKE) {
-      if (sleepPhase == SLEEP_DARK) setBacklightBrightness(brightnessLevel);
+      if (sleepPhase == SLEEP_DARK) setBacklightBrightness(255);
       exitSleepRestoreDashboard();
       sleepPhase = SLEEP_AWAKE;
     }
@@ -2977,7 +2949,7 @@ void pollSleepSchedule() {
 
     case SLEEP_DARK:
       if (!inWindow) {
-        setBacklightBrightness(brightnessLevel);
+        setBacklightBrightness(255);
         exitSleepRestoreDashboard();
         sleepPhase = SLEEP_AWAKE;
         DBG_INFO("Sleep: window ended, waking");
@@ -3012,7 +2984,7 @@ void setup() {
   startBacklightPwm();
 #endif
   touch_init();
-  setBacklightBrightness(brightnessLevel);
+  setBacklightBrightness(255);
 
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE);
@@ -3021,6 +2993,7 @@ void setup() {
   lcd.drawString("Connecting...", 400, 240);
   markScreenUpdated();
 
+  loadOverlaySettings();
   loadSleepSettings();
 
   bool wifiOk = initWiFi();
@@ -3149,7 +3122,7 @@ void loop() {
   if (sleepPhase == SLEEP_DARK || sleepPhase == SLEEP_PENDING) {
     // Only handle touch to wake when the display is off.
     if (sleepPhase == SLEEP_DARK && touch_has_signal() && touch_touched()) {
-      setBacklightBrightness(brightnessLevel);
+      setBacklightBrightness(255);
       exitSleepRestoreDashboard();
       sleepPhase   = SLEEP_TOUCH_WOKEN;
       sleepPhaseMs = millis();
