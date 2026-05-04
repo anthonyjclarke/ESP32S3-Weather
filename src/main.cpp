@@ -37,7 +37,6 @@ unsigned long lastUpdate = 0;
 long radarTS = 0;
 int appState = 0;
 int lastMinute = -1;
-int brightnessLevel = 100;
 int mapStyle = cfg::kDefaultMapStyle;   // 0 = dark_all, 1 = opentopomap, 2 = openstreetmap
 int layerStyle = 0; // 0 = Radar, 1 = Clouds, 2 = Rain
 bool owmAuthFailed = false;
@@ -115,6 +114,7 @@ int      sleepOnMinute         = cfg::kSleepOnMinute;
 int      sleepOffHour          = cfg::kSleepOffHour;
 int      sleepOffMinute        = cfg::kSleepOffMinute;
 int      sleepWakeDurationSecs = cfg::kSleepWakeDurationSecs;
+uint8_t  sleepDimBrightness    = cfg::kSleepDimBrightness;
 
 enum SleepPhase : uint8_t {
   SLEEP_AWAKE,        // normal operation
@@ -124,6 +124,7 @@ enum SleepPhase : uint8_t {
 };
 SleepPhase   sleepPhase   = SLEEP_AWAKE;
 unsigned long sleepPhaseMs = 0;
+bool         sleepForced  = false;
 
 constexpr int kTileSize = 256;
 constexpr int kMapCanvasHeight = 415;
@@ -134,7 +135,6 @@ float dMax[16], dMin[16], dRain[16], dPress[16], dCloud[16];
 float dHum[16], dWind[16], dUV[16], dSolar[16];
 int dCode[16];
 
-void setBrightnessFromTouchY(int ty);
 void getWeatherData();
 void renderRadarMap();
 void triggerRenderForLayer(int targetLayer, bool forceRefresh = false);
@@ -155,6 +155,8 @@ void markScreenUpdated();
 void setupWebUi(bool wifiOk);
 void handleWebUiClient();
 bool handleUiTouch(int tx, int ty, bool debounce);
+void loadOverlaySettings();
+void saveOverlaySettings();
 void loadSleepSettings();
 void saveSleepSettings();
 bool isInSleepWindow();
@@ -628,7 +630,7 @@ String jsonEscape(const String& value) {
 
 String buildStatusJson() {
   String json;
-  json.reserve(2700);
+  json.reserve(2800);
   json += "{";
   json += "\"frameVersion\":" + String((uint32_t)screenFrameVersion);
   json += ",\"uptimeMs\":" + String(millis());
@@ -642,7 +644,6 @@ String buildStatusJson() {
   json += ",\"renderTilesTotal\":" + String((int)renderTilesTotal);
   json += ",\"lastUpdateAgeSec\":" + String((millis() - lastUpdate) / 1000UL);
   json += ",\"refreshSec\":" + String(cfg::kRealtimeRefreshSecs);
-  json += ",\"brightness\":" + String(brightnessLevel);
   json += ",\"overlayAlpha\":{";
   json += "\"radar\":" + String(overlayAlphaPercent[0]);
   json += ",\"clouds\":" + String(overlayAlphaPercent[1]);
@@ -703,6 +704,8 @@ String buildStatusJson() {
     json += ",\"inWindow\":" + String(isInSleepWindow() ? "true" : "false");
     json += ",\"wakeSecs\":" + String(sleepWakeDurationSecs);
     json += ",\"wakeRemainSecs\":" + String(wakeRemain);
+    json += ",\"dimBrightness\":" + String(sleepDimBrightness);
+    json += ",\"forced\":" + String(sleepForced ? "true" : "false");
     json += "}";
   }
 
@@ -801,6 +804,7 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     a { color: #7dd3fc; text-decoration: none; }
     a:hover { text-decoration: underline; }
     @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } header { align-items: start; flex-direction: column; } .hw { grid-template-columns: 1fr; } }
+    .zoom-arrow { color: var(--muted); font-size: 11px; }
     .sched-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 0; border-bottom:1px solid var(--line); }
     .sched-row:last-child { border-bottom:none; }
     .sched-row > label:first-child { color:var(--muted); font-size:13px; flex:1; }
@@ -837,7 +841,7 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       <section class="card">
         <h2>Layer Cache</h2>
         <table>
-          <thead><tr><th>Layer</th><th>Status</th><th>Age</th><th>Cache Zoom</th><th>Cache Map</th></tr></thead>
+          <thead><tr><th>Layer</th><th>Status</th><th>Age</th><th>Cached At</th><th>Cache Map</th></tr></thead>
           <tbody id="layers"></tbody>
         </table>
       </section>
@@ -849,24 +853,19 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <output id="zoomOut">7</output>
         </div>
         <div class="control">
-          <label for="brightnessControl">Brightness</label>
-          <input id="brightnessControl" type="range" min="20" max="255" step="1" value="100">
-          <output id="brightnessOut">100</output>
-        </div>
-        <div class="control">
           <label for="radarAlphaControl">Radar opacity</label>
-          <input id="radarAlphaControl" type="range" min="0" max="100" step="1" value="55">
-          <output id="radarAlphaOut">55%</output>
+          <input id="radarAlphaControl" type="range" min="0" max="100" step="1" value="50">
+          <output id="radarAlphaOut">50%</output>
         </div>
         <div class="control">
           <label for="cloudAlphaControl">Cloud opacity</label>
-          <input id="cloudAlphaControl" type="range" min="0" max="100" step="1" value="25">
-          <output id="cloudAlphaOut">25%</output>
+          <input id="cloudAlphaControl" type="range" min="0" max="100" step="1" value="50">
+          <output id="cloudAlphaOut">50%</output>
         </div>
         <div class="control">
           <label for="rainAlphaControl">Rain opacity</label>
-          <input id="rainAlphaControl" type="range" min="0" max="100" step="1" value="25">
-          <output id="rainAlphaOut">25%</output>
+          <input id="rainAlphaControl" type="range" min="0" max="100" step="1" value="50">
+          <output id="rainAlphaOut">50%</output>
         </div>
       </section>
       <section class="card">
@@ -891,7 +890,16 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <label for="sleepOffTime">Wake at</label>
           <input id="sleepOffTime" type="time" class="time-input">
         </div>
+        <div class="control">
+          <label for="sleepDimControl">Display Brightness</label>
+          <input id="sleepDimControl" type="range" min="0" max="255" step="1" value="70">
+          <output id="sleepDimOut">70</output>
+        </div>
         <div id="sleepStatus" class="sched-status"></div>
+        <div class="sched-row" style="margin-top:.75rem;padding-top:.75rem;border-top:1px solid var(--line)">
+          <label for="sleepForcedEl">Force sleep now</label>
+          <label class="toggle"><input id="sleepForcedEl" type="checkbox"><span class="slider"></span></label>
+        </div>
       </section>
     </div>
     <footer>
@@ -903,19 +911,20 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
   <script>
     const mirror = document.getElementById('mirror');
     const zoomControl = document.getElementById('zoomControl');
-    const brightnessControl = document.getElementById('brightnessControl');
     const radarAlphaControl = document.getElementById('radarAlphaControl');
     const cloudAlphaControl = document.getElementById('cloudAlphaControl');
     const rainAlphaControl = document.getElementById('rainAlphaControl');
     const zoomOut = document.getElementById('zoomOut');
-    const brightnessOut = document.getElementById('brightnessOut');
     const radarAlphaOut = document.getElementById('radarAlphaOut');
     const cloudAlphaOut = document.getElementById('cloudAlphaOut');
     const rainAlphaOut = document.getElementById('rainAlphaOut');
     const sleepEnabledEl = document.getElementById('sleepEnabled');
     const sleepOnEl      = document.getElementById('sleepOnTime');
     const sleepOffEl     = document.getElementById('sleepOffTime');
+    const sleepDimControl = document.getElementById('sleepDimControl');
+    const sleepDimOut    = document.getElementById('sleepDimOut');
     const sleepStatusEl  = document.getElementById('sleepStatus');
+    const sleepForcedEl  = document.getElementById('sleepForcedEl');
     let lastFrame = -1;
     let settingTimer = 0;
     let activeControl = null;
@@ -939,10 +948,6 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
         zoomControl.value = s.zoom;
         zoomOut.textContent = s.zoom;
       }
-      if (activeControl !== 'brightness') {
-        brightnessControl.value = s.brightness;
-        brightnessOut.textContent = s.brightness;
-      }
       if (s.overlayAlpha) {
         if (activeControl !== 'radarAlpha') {
           radarAlphaControl.value = s.overlayAlpha.radar;
@@ -957,9 +962,17 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           rainAlphaOut.textContent = `${s.overlayAlpha.rain}%`;
         }
       }
-      document.getElementById('layers').innerHTML = s.layers.map(l =>
-        `<tr><td>${l.name}</td><td class="${l.status}">${l.status}</td><td>${l.ageLabel} (${l.ageSec}s)</td><td>${l.valid ? l.zoom : '--'}</td><td>${l.valid ? l.map : '--'}</td></tr>`
-      ).join('');
+      document.getElementById('layers').innerHTML = s.layers.map(l => {
+        let zCell;
+        if (!l.valid) {
+          zCell = '--';
+        } else if (l.zoom === s.zoom) {
+          zCell = `<span class="fresh">Zoom ${l.zoom}</span>`;
+        } else {
+          zCell = `<span class="bad">Zoom ${l.zoom}</span><span class="zoom-arrow">&nbsp;&rarr;&nbsp;Zoom ${s.zoom}</span>`;
+        }
+        return `<tr><td>${l.name}</td><td class="${l.status}">${l.status}</td><td>${l.ageLabel} (${l.ageSec}s)</td><td>${zCell}</td><td>${l.valid ? l.map : '--'}</td></tr>`;
+      }).join('');
       document.getElementById('hardware').innerHTML = [
         metric('IP Address', s.hardware.ip),
         metric('SSID / RSSI', `${s.hardware.ssid || '--'} / ${s.hardware.rssi} dBm`),
@@ -976,6 +989,11 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
         if (document.activeElement !== sleepEnabledEl) sleepEnabledEl.checked = sl.enabled;
         if (document.activeElement !== sleepOnEl)  sleepOnEl.value  = sl.onTime  || '';
         if (document.activeElement !== sleepOffEl) sleepOffEl.value = sl.offTime || '';
+        if (activeControl !== 'sleepDimBrightness') {
+          sleepDimControl.value = sl.dimBrightness;
+          sleepDimOut.textContent = sl.dimBrightness;
+        }
+        if (document.activeElement !== sleepForcedEl) sleepForcedEl.checked = sl.forced || false;
         const stateColor = { awake:'var(--accent2)', pending:'var(--warn)', dark:'var(--muted)', woken:'var(--warn)' };
         const stateLabel = { awake:'awake', pending:'sleeping soon…', dark:'display off', woken:'touch-woken' };
         sleepStatusEl.innerHTML =
@@ -1041,11 +1059,6 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       scheduleConfig('zoom', zoomControl.value);
     });
 
-    brightnessControl.addEventListener('input', () => {
-      brightnessOut.textContent = brightnessControl.value;
-      scheduleConfig('brightness', brightnessControl.value);
-    });
-
     radarAlphaControl.addEventListener('input', () => {
       radarAlphaOut.textContent = `${radarAlphaControl.value}%`;
       scheduleConfig('radarAlpha', radarAlphaControl.value);
@@ -1076,6 +1089,11 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     sleepEnabledEl.addEventListener('change', () => setConfig({ sleepEnabled: sleepEnabledEl.checked }));
     sleepOnEl.addEventListener('change',  () => setConfig({ sleepOnTime:  sleepOnEl.value }));
     sleepOffEl.addEventListener('change', () => setConfig({ sleepOffTime: sleepOffEl.value }));
+    sleepDimControl.addEventListener('input', () => {
+      sleepDimOut.textContent = sleepDimControl.value;
+      scheduleConfig('sleepDimBrightness', sleepDimControl.value);
+    });
+    sleepForcedEl.addEventListener('change', () => setConfig({ sleepForce: sleepForcedEl.checked }));
 
     poll();
     setInterval(poll, 1000);
@@ -1147,7 +1165,7 @@ void handleWebTouch() {
   }
 
   if (sleepPhase == SLEEP_DARK) {
-    setBacklightBrightness(brightnessLevel);
+    setBacklightBrightness(255);
     exitSleepRestoreDashboard();
     sleepPhase   = SLEEP_TOUCH_WOKEN;
     sleepPhaseMs = millis();
@@ -1183,14 +1201,6 @@ void handleWebConfig() {
 
   bool changed = false;
   bool currentLayerAlphaChanged = false;
-
-  if (doc.containsKey("brightness")) {
-    int requested = doc["brightness"] | brightnessLevel;
-    brightnessLevel = constrain(requested, 20, 255);
-    setBacklightBrightness(brightnessLevel);
-    if (appState == 0) drawProgressTimer();
-    changed = true;
-  }
 
   if (doc.containsKey("zoom")) {
     int requested = doc["zoom"] | myZoom;
@@ -1242,6 +1252,10 @@ void handleWebConfig() {
     }
   }
 
+  if (doc.containsKey("radarAlpha") || doc.containsKey("cloudAlpha") || doc.containsKey("rainAlpha")) {
+    saveOverlaySettings();
+  }
+
   if (currentLayerAlphaChanged) {
     DBG_INFO("WebUI opacity changed | layer=%s alpha=%d%%",
              layerNames[layerStyle], overlayAlphaPercent[layerStyle]);
@@ -1275,6 +1289,44 @@ void handleWebConfig() {
       sleepOffHour   = h;
       sleepOffMinute = m;
       saveSleepSettings();
+      changed = true;
+    }
+  }
+
+  if (doc.containsKey("sleepDimBrightness")) {
+    int requested = doc["sleepDimBrightness"] | sleepDimBrightness;
+    uint8_t nextDim = (uint8_t)constrain(requested, 0, 255);
+    if (nextDim != sleepDimBrightness) {
+      sleepDimBrightness = nextDim;
+      saveSleepSettings();
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+      if (sleepPhase == SLEEP_DARK) {
+        setBacklightDim(sleepDimBrightness);
+      }
+#endif
+      DBG_INFO("Sleep dim brightness → %u/255", (unsigned)sleepDimBrightness);
+      changed = true;
+    }
+  }
+
+  if (doc.containsKey("sleepForce")) {
+    bool force = doc["sleepForce"].as<bool>();
+    if (force != sleepForced) {
+      sleepForced = force;
+      if (force) {
+        drawSleepScreen();
+        sleepPhase   = SLEEP_PENDING;
+        sleepPhaseMs = millis();
+        DBG_INFO("Sleep: force-sleep enabled via WebUI");
+      } else {
+        if (sleepPhase == SLEEP_DARK || sleepPhase == SLEEP_PENDING) {
+          setBacklightBrightness(255);
+        }
+        exitSleepRestoreDashboard();
+        sleepPhase   = SLEEP_AWAKE;
+        sleepPhaseMs = 0;
+        DBG_INFO("Sleep: force-sleep cleared via WebUI");
+      }
       changed = true;
     }
   }
@@ -1507,21 +1559,6 @@ void drawSignature() {
   markScreenUpdated();
 }
 
-void setBrightnessFromTouchY(int ty) {
-  int bx = 4, by = 4, bh = 409;
-
-  if (ty < by) ty = by;
-  if (ty > by + bh) ty = by + bh;
-
-  // top of bar = dim, bottom = bright
-  brightnessLevel = map(ty, by, by + bh, 255, 20);
-
-  if (brightnessLevel < 20) brightnessLevel = 20;
-  if (brightnessLevel > 255) brightnessLevel = 255;
-
-  setBacklightBrightness(brightnessLevel);
-}
-
 static bool initWiFi() {
   WiFiManager wm;
   bool hasSaved = WiFi.SSID().length() > 0;
@@ -1634,10 +1671,6 @@ void drawProgressTimer() {
     lcd.drawFastHLine(bx + 7, (by + bh - 7) - y, bw - 14, TFT_SKYBLUE);
   }
 
-  // Brightness marker
-  int markerY = map(brightnessLevel, 255, 20, by, by + bh);
-  lcd.drawFastHLine(bx + 4, markerY, bw - 8, TFT_YELLOW);
-  lcd.drawFastHLine(bx + 4, markerY - 1, bw - 8, TFT_YELLOW);
   markScreenUpdated();
 }
 
@@ -2388,13 +2421,15 @@ void drawSideButtons() {
 // Must only be called from Core 0 after a sprite push.
 // ---------------------------------------------------------------------------
 void drawMapBadges() {
-  int mapX = 740, mapY = 387, mapW = 60, mapH = 22;
+  int mapX = 696, mapY = 387, mapW = 104, mapH = 22;
   lcd.fillRect(mapX, mapY, mapW, mapH, panelColor);
   lcd.drawRect(mapX, mapY, mapW, mapH, TFT_WHITE);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(1);
   lcd.setTextDatum(middle_center);
-  lcd.drawString(mapNames[mapStyle], mapX + mapW / 2, mapY + mapH / 2);
+  char mapLabel[20];
+  snprintf(mapLabel, sizeof(mapLabel), "%s Zoom %d", mapNames[mapStyle], myZoom);
+  lcd.drawString(mapLabel, mapX + mapW / 2, mapY + mapH / 2);
 
   int layerX = 348, layerY = 4, layerW = 104, layerH = 40;
   lcd.fillRect(layerX, layerY, layerW, layerH, panelColor);
@@ -2689,10 +2724,18 @@ void renderTaskFn(void*) {
                 xPortGetCoreID(), renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
     renderRadarMap();
     setRenderDiagPhase("cache_copy");
-    renderScratch.pushSprite(layerCacheSprites[completedLayer], 0, 0);
-    markLayerCacheUpdated(completedLayer);
-    if (completedLayer == layerStyle) {
-      mapFront = layerCacheSprites[completedLayer];
+    // Discard result if zoom or map style changed while the render was in-flight.
+    // Core 0 will re-trigger via renderPending at the current settings.
+    if (renderZoom != myZoom || renderMapStyle != mapStyle) {
+      DBG_INFO("Render discarded (stale) | layer=%s zoom=%d→%d map=%s→%s",
+               layerNames[completedLayer], renderZoom, myZoom,
+               mapNames[renderMapStyle], mapNames[mapStyle]);
+    } else {
+      renderScratch.pushSprite(layerCacheSprites[completedLayer], 0, 0);
+      markLayerCacheUpdated(completedLayer);
+      if (completedLayer == layerStyle) {
+        mapFront = layerCacheSprites[completedLayer];
+      }
     }
     renderState = RENDER_READY;
 #if DEBUG_LEVEL >= 4
@@ -2709,12 +2752,6 @@ void renderTaskFn(void*) {
 // ---------------------------------------------------------------------------
 
 bool handleUiTouch(int tx, int ty, bool debounce) {
-  if (appState == 0 && tx >= 0 && tx <= 32 && ty >= 4 && ty <= 413) {
-    setBrightnessFromTouchY(ty);
-    drawProgressTimer();
-    return true;
-  }
-
   if (debounce && millis() - lastUiTouchMs <= 600) return false;
 
   bool handled = false;
@@ -2785,6 +2822,24 @@ bool handleUiTouch(int tx, int ty, bool debounce) {
 // Sleep schedule helpers
 // ---------------------------------------------------------------------------
 
+void loadOverlaySettings() {
+  prefs.begin("overlays", true);
+  overlayAlphaPercent[0] = prefs.getInt("radar",  cfg::kRadarOverlayAlphaPercent);
+  overlayAlphaPercent[1] = prefs.getInt("clouds", cfg::kCloudOverlayAlphaPercent);
+  overlayAlphaPercent[2] = prefs.getInt("rain",   cfg::kRainOverlayAlphaPercent);
+  prefs.end();
+  DBG_INFO("Overlay alpha loaded | radar=%d%% clouds=%d%% rain=%d%%",
+           overlayAlphaPercent[0], overlayAlphaPercent[1], overlayAlphaPercent[2]);
+}
+
+void saveOverlaySettings() {
+  prefs.begin("overlays", false);
+  prefs.putInt("radar",  overlayAlphaPercent[0]);
+  prefs.putInt("clouds", overlayAlphaPercent[1]);
+  prefs.putInt("rain",   overlayAlphaPercent[2]);
+  prefs.end();
+}
+
 void loadSleepSettings() {
   prefs.begin("sleepsch", true);
   sleepScheduleEnabled  = prefs.getBool("enabled",  cfg::kSleepScheduleEnabled);
@@ -2793,10 +2848,12 @@ void loadSleepSettings() {
   sleepOffHour          = prefs.getInt("offHour",   cfg::kSleepOffHour);
   sleepOffMinute        = prefs.getInt("offMin",    cfg::kSleepOffMinute);
   sleepWakeDurationSecs = prefs.getInt("wakeSecs",  cfg::kSleepWakeDurationSecs);
+  sleepDimBrightness    = prefs.getUChar("dim",     cfg::kSleepDimBrightness);
   prefs.end();
-  DBG_INFO("Sleep settings loaded | enabled=%d on=%02d:%02d off=%02d:%02d wake=%ds",
+  DBG_INFO("Sleep settings loaded | enabled=%d on=%02d:%02d off=%02d:%02d wake=%ds dim=%u/255",
            sleepScheduleEnabled, sleepOnHour, sleepOnMinute,
-           sleepOffHour, sleepOffMinute, sleepWakeDurationSecs);
+           sleepOffHour, sleepOffMinute, sleepWakeDurationSecs,
+           (unsigned)sleepDimBrightness);
 }
 
 void saveSleepSettings() {
@@ -2807,6 +2864,7 @@ void saveSleepSettings() {
   prefs.putInt("offHour",   sleepOffHour);
   prefs.putInt("offMin",    sleepOffMinute);
   prefs.putInt("wakeSecs",  sleepWakeDurationSecs);
+  prefs.putUChar("dim",     sleepDimBrightness);
   prefs.end();
 }
 
@@ -2850,16 +2908,17 @@ void exitSleepRestoreDashboard() {
 void pollSleepSchedule() {
   if (!firstRenderDone) return;
 
-  if (!sleepScheduleEnabled) {
+  if (!sleepScheduleEnabled && !sleepForced) {
     if (sleepPhase != SLEEP_AWAKE) {
-      if (sleepPhase == SLEEP_DARK) setBacklightBrightness(brightnessLevel);
+      if (sleepPhase == SLEEP_DARK) setBacklightBrightness(255);
       exitSleepRestoreDashboard();
       sleepPhase = SLEEP_AWAKE;
     }
     return;
   }
 
-  bool inWindow = isInSleepWindow();
+  // When forced, treat as permanently in-window so window-exit logic never fires.
+  bool inWindow = sleepForced ? true : isInSleepWindow();
   unsigned long now = millis();
 
   switch (sleepPhase) {
@@ -2877,15 +2936,20 @@ void pollSleepSchedule() {
         exitSleepRestoreDashboard();
         sleepPhase = SLEEP_AWAKE;
       } else if (now - sleepPhaseMs >= 2000) {
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+        setBacklightDim(sleepDimBrightness);
+        DBG_INFO("Sleep: backlight dimmed to %u/255", (unsigned)sleepDimBrightness);
+#else
         setBacklightBrightness(0);
-        sleepPhase = SLEEP_DARK;
         DBG_INFO("Sleep: backlight off");
+#endif
+        sleepPhase = SLEEP_DARK;
       }
       break;
 
     case SLEEP_DARK:
       if (!inWindow) {
-        setBacklightBrightness(brightnessLevel);
+        setBacklightBrightness(255);
         exitSleepRestoreDashboard();
         sleepPhase = SLEEP_AWAKE;
         DBG_INFO("Sleep: window ended, waking");
@@ -2915,8 +2979,12 @@ void setup() {
   lcd.init();
   lcd.setRotation(0);
   lcd.setColorDepth(16);
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  // Mutex must exist before touch_init() which takes it via WIRE_TAKE().
+  startBacklightPwm();
+#endif
   touch_init();
-  setBacklightBrightness(brightnessLevel);
+  setBacklightBrightness(255);
 
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE);
@@ -2925,6 +2993,7 @@ void setup() {
   lcd.drawString("Connecting...", 400, 240);
   markScreenUpdated();
 
+  loadOverlaySettings();
   loadSleepSettings();
 
   bool wifiOk = initWiFi();
@@ -2985,6 +3054,15 @@ void setup() {
   lastUpdate = realtimeRefreshLastMs;
   triggerRenderForLayer(layerStyle, false);
 
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  if (cfg::kSleepDimTestMode) {
+    setBacklightDim(sleepDimBrightness);
+    DBG_INFO("BL PWM test mode: dim to %u/255 (~%u%%)",
+             (unsigned)sleepDimBrightness,
+             (unsigned)(sleepDimBrightness * 100u / 255u));
+  }
+#endif
+
   logStartupBanner(wifiOk, ip.c_str());
 }
 
@@ -3044,7 +3122,7 @@ void loop() {
   if (sleepPhase == SLEEP_DARK || sleepPhase == SLEEP_PENDING) {
     // Only handle touch to wake when the display is off.
     if (sleepPhase == SLEEP_DARK && touch_has_signal() && touch_touched()) {
-      setBacklightBrightness(brightnessLevel);
+      setBacklightBrightness(255);
       exitSleepRestoreDashboard();
       sleepPhase   = SLEEP_TOUCH_WOKEN;
       sleepPhaseMs = millis();

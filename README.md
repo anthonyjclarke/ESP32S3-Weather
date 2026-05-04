@@ -54,7 +54,7 @@ http://ESP32S3-Weather.local/
 ```
 
 It serves a BMP mirror of the TFT that refreshes only when the firmware updates
-the display, plus layer cache status, zoom and brightness controls, hardware
+the display, plus layer cache status, zoom and overlay opacity controls, hardware
 memory/network status, reboot and WiFi reset actions, and footer links. Clicking
 the mirror sends the matching TFT touch coordinate back to the device.
 
@@ -150,7 +150,7 @@ redacts API keys before logging URLs.
 | WiFiManager captive portal | WiFi provisioning when no saved credentials are available. | Optional `SECRET_WIFI_SSID` and `SECRET_WIFI_PASS`; otherwise the user provisions through the `ESP32S3-Weather` access point. | `initWiFi()` in `src/main.cpp` uses `WiFiManager::autoConnect(cfg::kWifiApName)` after optionally starting `WiFi.begin()` with secrets. |
 | NTP | Local clock and date display. | None. | `setup()` calls `configTzTime(cfg::kNtpTimezone, "pool.ntp.org")` after WiFi connects. `loop()` uses `getLocalTime()` for minute updates. |
 | ArduinoOTA | Network firmware upload after initial serial flashing. | `SECRET_OTA_PASSWORD`, which must match the `--auth` value in the `esp32s3-7inch-ota` PlatformIO environment. | `setupOta()` in `src/main.cpp` configures hostname, password, progress/error handlers, and `ArduinoOTA.begin()`. `loop()` calls `ArduinoOTA.handle()` while WiFi is connected. |
-| Local WebUI | Browser-based TFT mirror, layer cache status, immediate zoom/brightness/overlay opacity controls, hardware environment info, reboot/WiFi reset actions, and mirrored touch input on the LAN. | None; local LAN only. | `setupWebUi()` in `src/main.cpp` starts `WebServer` on port 80. `/screen.bmp` streams the LCD framebuffer as BMP, `/api/status` returns cache/render/hardware state, `/api/config` applies zoom/brightness and RADAR/CLOUDS/RAIN opacity changes, `/api/touch` maps browser clicks back to TFT coordinates, and `/api/reboot` plus `/api/reset-wifi` handle device actions. |
+| Local WebUI | Browser-based TFT mirror, layer cache status, immediate zoom and overlay opacity controls, hardware environment info, reboot/WiFi reset actions, and mirrored touch input on the LAN. | None; local LAN only. | `setupWebUi()` in `src/main.cpp` starts `WebServer` on port 80. `/screen.bmp` streams the LCD framebuffer as BMP, `/api/status` returns cache/render/hardware state, `/api/config` applies zoom and RADAR/CLOUDS/RAIN opacity changes (persisted to NVS), `/api/touch` maps browser clicks back to TFT coordinates, and `/api/reboot` plus `/api/reset-wifi` handle device actions. |
 
 `cfg::kRealtimeRefreshSecs` controls how often the firmware refreshes
 Open-Meteo data, RainViewer metadata, and stale rendered layer caches. Layer,
@@ -200,8 +200,9 @@ forced, or no longer matches the active map style or zoom.
 ## Notes
 
 The Waveshare board backlight is controlled through the CH422G expander as a
-digital enable. The on-screen brightness slider therefore behaves as an on/off
-backlight control on this hardware.
+digital enable. The normal brightness control is therefore steady on/off; when
+`CFG_BACKLIGHT_PWM_ENABLED` is enabled, firmware software-PWMs that CH422G output
+only for explicit sleep dimming.
 
 ## Reference Docs
 

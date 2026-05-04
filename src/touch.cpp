@@ -3,6 +3,18 @@
 #include <Wire.h>
 #include "config.h"
 #include "debug.h"
+#include "display_hw.h"
+
+// When CFG_BACKLIGHT_PWM_ENABLED is active, the PWM task (Core 0) and touch
+// polling (Core 1) share the Wire bus. These macros gate access via gWireMutex.
+// When PWM is disabled the macros expand to nothing — zero overhead.
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+#  define WIRE_TAKE() xSemaphoreTake(gWireMutex, portMAX_DELAY)
+#  define WIRE_GIVE() xSemaphoreGive(gWireMutex)
+#else
+#  define WIRE_TAKE() true
+#  define WIRE_GIVE() ((void)0)
+#endif
 
 void resetTouchController();
 
@@ -14,24 +26,30 @@ static bool touchActive = false;
 static uint32_t lastPollMs = 0;
 
 static bool gt911WriteReg(uint16_t reg, uint8_t val) {
+  WIRE_TAKE();
   Wire.beginTransmission(TOUCH_I2C_ADDR);
   Wire.write((uint8_t)(reg >> 8));
   Wire.write((uint8_t)(reg & 0xFF));
   Wire.write(val);
-  return Wire.endTransmission() == 0;
+  bool ok = Wire.endTransmission() == 0;
+  WIRE_GIVE();
+  return ok;
 }
 
 static bool gt911ReadBytes(uint16_t reg, uint8_t* buf, size_t len) {
+  WIRE_TAKE();
   Wire.beginTransmission(TOUCH_I2C_ADDR);
   Wire.write((uint8_t)(reg >> 8));
   Wire.write((uint8_t)(reg & 0xFF));
-  if (Wire.endTransmission(false) != 0) return false;
-
-  if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, len) != len) return false;
-  for (size_t i = 0; i < len; i++) {
-    buf[i] = Wire.read();
+  bool ok = Wire.endTransmission(false) == 0;
+  if (ok) {
+    ok = Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, len) == len;
+    if (ok) {
+      for (size_t i = 0; i < len; i++) buf[i] = Wire.read();
+    }
   }
-  return true;
+  WIRE_GIVE();
+  return ok;
 }
 
 static void transformTouch(uint16_t rawX, uint16_t rawY) {

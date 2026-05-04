@@ -1,7 +1,8 @@
 # Changelog
 
 ## Todo
-- Stop screen Glitching
+- Add TZ selection in WebUI
+- Tidy up Social status line in WebUI
 - Evaluate free-to-use API alternatives based on current usage in the README
   `## API` section. Keep Open-Meteo as the forecast baseline if
   non-commercial limits fit the project; compare OpenFreeMap or self-hosted
@@ -14,6 +15,80 @@
 - Based on Zoom if data not available then skip display with a status message to advise
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
+
+## [1.5.2] 04-05-2026
+
+### Added
+
+- Overlay opacity settings (Radar, Clouds, Rain) now persisted to NVS under
+  the `"overlays"` Preferences namespace, keys `radar`, `clouds`, `rain`.
+  Values are loaded at boot and saved immediately on any WebUI change.
+  Default changed to 50% for all three layers (was 55/25/25).
+
+### Changed
+
+- WebUI Night Schedule: **Sleep dim** control renamed to **Display Brightness**.
+- Removed the WebUI Brightness slider and all associated code. The CH422G
+  backlight is digital on/off at full brightness; the slider had no effect
+  beyond toggling on/off and was misleading. Brightness during the sleep window
+  is still controlled by the Display Brightness slider in Night Schedule.
+- Removed left-edge touch brightness zone on the physical display (drag-to-dim
+  gesture), and the yellow brightness-level marker from the progress-timer bar,
+  for the same reason.
+
+### Fixed
+
+- Startup TFT version string now matches `kFwVersion` in `config.h`. Was
+  displaying `1.4.0` (stale value) despite subsequent version bumps.
+
+## [1.5.1] 2026-05-03
+
+### Added
+
+- TFT map-style badge now includes the active zoom level, e.g. `TOPO Zoom 7`,
+  for every base map style.
+- WebUI Night Schedule card: **Sleep dim** slider for `kSleepDimBrightness`.
+  The value is persisted in NVS and applies immediately while sleep mode is dark.
+- WebUI Night Schedule card: **Force sleep now** toggle. Activates sleep mode immediately regardless of the schedule window — useful for testing PWM dimming and for manual override outside normal sleep hours. Cleared automatically on toggle-off; not persisted to NVS.
+
+### Fixed
+
+- `display_hw.cpp`: full-on PWM could skip the initial CH422G pin-high write
+  because the PWM task started with `lastB = 255`; steady 0/255 states now
+  force their first write.
+- `setBacklightBrightness()` stays steady on/off when `CFG_BACKLIGHT_PWM_ENABLED`
+  is active. Software PWM is reserved for `setBacklightDim()` so the awake TFT
+  backlight does not flicker.
+- `display_hw.cpp`: `std::max()` type-deduction error (`unsigned int` vs `uint32_t`) on toolchain GCC 14 — both arguments now explicitly cast to `uint32_t`.
+- `setup()`: init-order crash when `CFG_BACKLIGHT_PWM_ENABLED` is active — `touch_init()` was called before `startBacklightPwm()`, so `gWireMutex` was `nullptr` when `WIRE_TAKE()` fired inside `gt911ReadBytes()`. `startBacklightPwm()` (mutex creation + task start) now runs before `touch_init()`.
+- `renderTaskFn`: stale render displayed when zoom or map style changed mid-render — the in-flight render at the old settings would re-validate the layer cache (overwriting the `invalidateLayerCaches()` that zoom-change triggers) and update `mapFront` to the wrong-zoom sprite. Render result is now discarded if `renderZoom != myZoom || renderMapStyle != mapStyle` at completion; Core 0 re-triggers via `renderPending`.
+
+## [1.5.0] 2026-05-03
+
+### Added
+
+- Software PWM backlight dimming via CH422G I2C, controlled by feature flag
+  `CFG_BACKLIGHT_PWM_ENABLED` in `config.h`. Disabled by default — the build
+  retains original digital on/off behaviour until the flag is uncommented.
+- When enabled, a FreeRTOS task (`bl_pwm`, Core 0, priority 2) drives the
+  backlight at 100 Hz with proportional duty cycle. At 0 and 255 the pin is
+  held steady with no toggling.
+- `setBacklightDim(uint8_t)` — new function for proportional brightness
+  (0=off, 255=full, 1–254 = ~10% duty steps). Distinct from
+  `setBacklightBrightness()` which retains on/off semantics.
+- `startBacklightPwm()` — call once from `setup()` after `touch_init()`. Wires
+  up the mutex and spawns the task.
+- `gWireMutex` — `SemaphoreHandle_t` protecting the shared I2C bus between the
+  PWM task (Core 0) and GT911 touch polling (Core 1). Active only when flag is
+  set; zero overhead otherwise.
+- `kSleepDimBrightness` (default 30/255 ≈ 12%) — configurable sleep dim level.
+- `kSleepDimTestMode` (default false) — when true, immediately dims to
+  `kSleepDimBrightness` after boot so the level can be evaluated without waiting
+  for the sleep window.
+- Sleep state machine updated: when `CFG_BACKLIGHT_PWM_ENABLED` is set, the
+  `SLEEP_PENDING → SLEEP_DARK` transition calls `setBacklightDim()` instead of
+  turning off. All wake paths continue to use `setBacklightBrightness()` and
+  restore full brightness unchanged.
 
 ## [1.4.0] 2026-05-02
 
