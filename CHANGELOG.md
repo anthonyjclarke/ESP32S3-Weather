@@ -16,6 +16,26 @@
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
 
+## [1.5.3] 09-05-2026
+
+### Fixed
+
+- Clock showing wrong time (epoch/00:00) on startup — `setup()` now waits up
+  to 10 s for the first NTP sync to complete before proceeding. "Syncing
+  time..." shown on the startup splash during the wait.
+- `drawBottomDashboard()` and `drawTopDate()` now guard `getLocalTime()` return
+  value; clock shows `--:--` and the date badge is hidden until NTP syncs,
+  instead of displaying junk from an uninitialised `tm` struct.
+- `getLocalTime()` in `loop()` changed to zero-timeout so it no longer stalls
+  the loop for up to 5 s when NTP hasn't synced yet.
+- WiFi reconnection after a drop no longer leaves the clock drifting — a
+  `ARDUINO_EVENT_WIFI_STA_GOT_IP` event handler now re-calls `configTzTime()`
+  whenever the device regains an IP address.
+- `initWiFi()` now explicitly enables `WiFi.setAutoReconnect(true)` on
+  successful connection.
+
+---
+
 ## [1.5.2] 04-05-2026
 
 ### Added

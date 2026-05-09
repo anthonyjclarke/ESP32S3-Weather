@@ -800,7 +800,11 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     .metric { border: 1px solid var(--line); background: rgba(255,255,255,.045); border-radius: 10px; padding: 10px; min-width: 0; }
     .metric .k { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
     .metric .v { display: block; overflow-wrap: anywhere; font-size: 14px; font-variant-numeric: tabular-nums; }
-    footer { color: var(--muted); display: flex; flex-wrap: wrap; gap: 10px 16px; margin: 20px 0 0; font-size: 13px; }
+    footer { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin:24px 0 0; padding-top:16px; border-top:1px solid var(--line); font-size:13px; color:var(--muted); }
+    .footer-social { display:flex; gap:10px; align-items:center; }
+    .social-link { display:inline-flex; align-items:center; gap:7px; color:var(--muted); padding:5px 12px; border-radius:20px; border:1px solid var(--line); transition:color .2s,border-color .2s,background .2s; font-size:13px; text-decoration:none; }
+    .social-link:hover { color:#fff; border-color:#7dd3fc; background:rgba(125,211,252,.1); text-decoration:none; }
+    .social-link svg { flex-shrink:0; }
     a { color: #7dd3fc; text-decoration: none; }
     a:hover { text-decoration: underline; }
     @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } header { align-items: start; flex-direction: column; } .hw { grid-template-columns: 1fr; } }
@@ -903,9 +907,17 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       </section>
     </div>
     <footer>
-      <span>Credits: Mirko Pavleski and Anthony Clarke.</span>
-      <a href="https://bsky.app/profile/anthonyjclarke.bsky.social" target="_blank" rel="noopener">BlueSky</a>
-      <a href="https://github.com/anthonyjclarke/ESP32S3-Weather" target="_blank" rel="noopener">GitHub Repo</a>
+      <span>Based on work by <a href="https://www.hackster.io/mircemk" target="_blank" rel="noopener">Mirko Pavleski</a> &mdash; adapted by Anthony Clarke</span>
+      <div class="footer-social">
+        <a href="https://bsky.app/profile/anthonyjclarke.bsky.social" target="_blank" rel="noopener" class="social-link" title="@anthonyjclarke.bsky.social">
+          <svg viewBox="0 0 568 501" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M123.121 33.664C188.241 82.553 258.281 181.68 284 234.873c25.719-53.192 95.759-152.32 160.879-201.21C491.866-1.611 568-28.906 568 57.947c0 17.346-9.945 145.713-15.778 166.555-20.275 72.453-94.155 90.933-159.875 79.748C507.222 323.8 536.444 388.56 473.333 453.32c-119.86 122.992-172.272-30.859-185.702-70.281-2.462-7.227-3.614-10.608-3.631-7.733-.017-2.875-1.169.506-3.631 7.733-13.43 39.422-65.842 193.273-185.702 70.281-63.111-64.76-33.889-129.52 80.986-149.07-65.72 11.185-139.6-7.295-159.875-79.748C9.945 203.659 0 75.293 0 57.947 0-28.906 76.134-1.611 123.121 33.664z"/></svg>
+          Bluesky
+        </a>
+        <a href="https://github.com/anthonyjclarke/ESP32S3-Weather" target="_blank" rel="noopener" class="social-link" title="ESP32S3-Weather on GitHub">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </div>
     </footer>
   </main>
   <script>
@@ -1570,7 +1582,9 @@ static bool initWiFi() {
     WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
   }
 
-  return wm.autoConnect(cfg::kWifiApName);
+  bool ok = wm.autoConnect(cfg::kWifiApName);
+  if (ok) WiFi.setAutoReconnect(true);
+  return ok;
 }
 
 void drawOtaStatus(const char* line1, const char* line2, int percent = -1) {
@@ -1676,7 +1690,7 @@ void drawProgressTimer() {
 
 void drawBottomDashboard() {
   struct tm timeinfo;
-  getLocalTime(&timeinfo);
+  bool timeOk = getLocalTime(&timeinfo, 0);
 
   int midW = 180;
   int midH = 95;
@@ -1687,7 +1701,11 @@ void drawBottomDashboard() {
   lcd.drawRect(midX, midY, midW, midH, TFT_WHITE);
 
   char clockStr[10];
-  sprintf(clockStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  if (timeOk) {
+    sprintf(clockStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  } else {
+    strcpy(clockStr, "--:--");
+  }
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(5);
   lcd.setTextDatum(top_center);
@@ -2362,7 +2380,7 @@ if (targetLayer == 0) {
 void drawTopDate() {
   if (appState != 0) return;
   struct tm ti;
-  getLocalTime(&ti);
+  if (!getLocalTime(&ti, 0)) return;
 
   char buf[40];
   sprintf(buf, "%s, %d. %s", days[ti.tm_wday], ti.tm_mday, months[ti.tm_mon]);
@@ -2999,9 +3017,30 @@ void setup() {
   bool wifiOk = initWiFi();
   String ip = "";
   if (wifiOk) {
-    configTzTime(cfg::kNtpTimezone, ntpServer);
     ip = WiFi.localIP().toString();
+    configTzTime(cfg::kNtpTimezone, ntpServer);
+
+    // Wait up to 10 s for first NTP sync — SNTP is async so without this the
+    // clock shows epoch time until it syncs sometime after setup() finishes.
+    lcd.setTextColor(TFT_CYAN);
+    lcd.drawString("Syncing time...", 400, 300);
+    markScreenUpdated();
+    struct tm ntpCheck;
+    if (!getLocalTime(&ntpCheck, 10000)) {
+      DBG_WARN("NTP initial sync timed out — clock may show wrong time");
+    } else {
+      DBG_INFO("NTP synced | %02d:%02d:%02d", ntpCheck.tm_hour, ntpCheck.tm_min, ntpCheck.tm_sec);
+    }
   }
+
+  // Re-run configTzTime whenever WiFi reconnects so the clock stays correct
+  // after a drop. The initial GOT_IP has already fired inside initWiFi(), so
+  // this handler only fires for subsequent reconnections.
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    DBG_INFO("WiFi reconnected — resyncing NTP");
+    configTzTime(cfg::kNtpTimezone, ntpServer);
+  }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+
   setupOta(wifiOk);
   setupWebUi(wifiOk);
 
@@ -3136,7 +3175,7 @@ void loop() {
   pollRenderWatchdog();
 
   // --- Per-minute dashboard update ---
-  if (appState == 0 && getLocalTime(&ti)) {
+  if (appState == 0 && getLocalTime(&ti, 0)) {
     if (ti.tm_min != lastMinute) {
       lastMinute = ti.tm_min;
       drawBottomDashboard();
