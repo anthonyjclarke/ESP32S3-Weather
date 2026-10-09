@@ -16,6 +16,19 @@
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
 
+## [1.5.4] 09-10-2026
+
+### Fixed
+
+- `initWiFi()` never detected saved WiFiManager credentials: it tested
+  `WiFi.SSID()`, which is only the network currently joined and is always
+  empty before `autoConnect()`. It now starts the STA driver with
+  `WiFi.mode(WIFI_STA)` and asks `wm.getWiFiIsSaved()`, which reads the stored
+  STA config. Credentials saved through the portal are now used instead of
+  being overwritten by the `secrets.h` pre-seed on every boot, and a board
+  with saved credentials but no `secrets.h` SSID now closes the portal after
+  15 s instead of waiting forever. Port of CYD_PongClock commit `2862967`.
+
 ## [1.5.3] 09-05-2026
 
 ### Fixed

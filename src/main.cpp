@@ -1573,7 +1573,10 @@ void drawSignature() {
 
 static bool initWiFi() {
   WiFiManager wm;
-  bool hasSaved = WiFi.SSID().length() > 0;
+  // WiFi.SSID() is only the joined network, so it is empty before autoConnect.
+  // getWiFiIsSaved() reads the stored STA config, which needs the driver started.
+  WiFi.mode(WIFI_STA);
+  bool hasSaved = wm.getWiFiIsSaved();
   bool hasSecret = strlen(SECRET_WIFI_SSID) > 0;
 
   wm.setConfigPortalTimeout((hasSaved || hasSecret) ? 15 : 0);
