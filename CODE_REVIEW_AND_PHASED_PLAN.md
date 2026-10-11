@@ -445,8 +445,60 @@ README includes a clearly labelled design preview; replace with a real board
 WebUI screenshot after acceptance. The remaining
 Phase 6 maintenance tasks are still open.
 
-Phases 4–5 resumed 12 October 2026 at the user's instruction. Done locally:
-caller workflow (`envs: esp32s3-7inch-public`, shared tooling `@main`) and a
-`7″` board label for the hub size filter. Remaining: push `dev` and check the
-`site-preview`, one-time Pages/tag-rule setup, hardware acceptance, `v*`
-release from `main`, then the hub `projects.json` entry. Ask before each push.
+## Phase 4 web installer integration — 12 October 2026 (DONE)
+
+v1.5.10 is published: GitHub release with `-firmware.bin`, `-merged.bin` and
+`SHA256SUMS.txt`, installer at https://anthonyjclarke.github.io/ESP32S3-Weather/,
+and a hub card (Dashboard, ESP32-S3, 7″). `dev` reopened at 1.6.0-dev.
+
+- `.github/workflows/firmware.yml` calls cyd-web-installer `@main` and builds
+  only `esp32s3-7inch-public`. Pages source is Actions; `github-pages` allows
+  the `v*` tag rule (GitHub also added a harmless `dev` branch rule).
+- Board label carries `7″` for the hub size filter.
+- Native USB fix (1.5.10): CH422G EXIO5 (`USB_SEL`) must stay low. Before this,
+  native USB never enumerated and Improv could not answer. On the UART port
+  (CH343) the installer only offers Install, by design.
+- Verified on hardware: native USB enumerates; Improv reports
+  `ESP32S3-Weather` 1.5.10 to the installer.
+
+## Phase 5 — remaining web installer work
+
+Publication happened before the items below were closed, so they are now
+post-release follow-ups. Track hardware results in `docs/WEB_INSTALLER.md`.
+
+**Hardware acceptance (needs the board):**
+
+1. Change Wi-Fi via Improv on native USB: correct and wrong password; the old
+   network must be restored after a failed join.
+2. Erased first install from the live page: Improv provisions WiFi during the
+   captive portal/startup downloads, restarts and offers the device URL.
+3. Device setup: save location/timezone/OWM key/OTA password, reboot, verify
+   persistence, blank retention, explicit clear and OTA-disabled behaviour.
+4. Update without erase (needs a newer release than the board): WiFi, device,
+   overlay and night settings survive.
+5. OTA to app1, then browser Update: app0 boots the new version.
+6. Cold power-cycle/USB reconnect: native USB re-enumerates and Improv answers
+   within 1.5 s during startup, render and night sleep.
+7. Wrong chip (a CYD) is refused by chip family.
+
+Items 4–5 are easiest with the next release (1.6.0), or by flashing a
+temporary `1.5.11-dev.0` from PlatformIO (never committed).
+
+**Before encouraging wider use (deferred Phase 2 P2s, `docs/PHASE_2_REVIEW.md`):**
+
+- Basemap/radar provider terms and on-screen attribution (Carto, OpenTopoMap,
+  OSM, RainViewer, OWM); choose a production tile source if required.
+- Verified TLS (CA bundle instead of `setInsecure()`), bounded JSON
+  streaming and end-to-end request deadlines.
+- PWM mutex/task allocation failure: fail-safe backlight; diagnostics snapshot.
+- Forecast labels from API timestamps (midnight/DST/failed refresh).
+- WebUI is unauthenticated HTTP: document trusted-LAN use in README and
+  evaluate auth/origin checks for settings, reboot and reset endpoints.
+
+**Decisions / housekeeping:**
+
+- Native-USB-only Improv (current) vs also answering on UART `Serial`.
+- Pin cyd-web-installer to a SHA (workflow `@<sha>` + `tools-ref`) or keep
+  `@main` like the CYD projects.
+- `ubuntu-latest` moves to Ubuntu 26 from 19-10-2026 (shared workflow).
+- Replace the README WebUI design preview with a real board screenshot.

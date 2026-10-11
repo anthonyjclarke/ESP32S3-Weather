@@ -1,8 +1,9 @@
 # ESP32S3-Weather web installer preparation
 
-Phase 3 prepared 12 October 2026, firmware **1.5.8**. This is local preparation;
-there is no published installer for this project yet. Phase 4 integrates the
-release workflow and hub, and Phase 5 records hardware install/update tests.
+Phase 3 prepared 12 October 2026 (firmware 1.5.8). Phase 4 published
+**v1.5.10** the same day: installer at
+<https://anthonyjclarke.github.io/ESP32S3-Weather/>, listed on the hub.
+Phase 5 hardware install/update tests are still pending (see below).
 
 ## Project contract
 
@@ -165,23 +166,19 @@ Recorded 12-10-2026: 1.5.10 flashed via UART with PlatformIO; on the native
 USB port the CI `site-preview` (1.5.9) connected and Improv reported
 `ESP32S3-Weather` 1.5.10. Same-firmware recognition over native USB: PASS.
 
-Still pending:
+Still pending (see Phase 5 in `CODE_REVIEW_AND_PHASED_PLAN.md`):
 
-1. Confirm visible LCD, working touch, WebUI version 1.5.8 and hourly cadence.
-2. Erased first install: Improv responds during the captive portal and startup
-   downloads, configures WiFi, restarts and offers the device URL.
-3. Connect again during startup/render/sleep: correct S3 name/version; matching
-   project offers Update. Test incorrect WiFi credentials and recovery.
-4. Save location/timezone/key/password, reboot and verify map/forecast agreement,
-   persistence, blank retention, explicit clear and OTA password behavior.
-5. Update without erase: WiFi, device setup, overlay and night settings survive.
-6. OTA to app1, then browser Update: app0 boots the new version.
-7. Wrong chip and wrong Waveshare variant: confirm appropriate rejection/selection;
-   chip identity alone cannot distinguish different S3 panels.
-8. USB reconnect/power-cycle, slow network, missing NTP and WebUI mirror latency.
+1. Change Wi-Fi via Improv: correct and wrong password, old network restored.
+2. Erased first install from the live page: Improv provisions WiFi, restarts
+   and offers the device URL.
+3. Device setup save/reboot: persistence, blank retention, explicit clear and
+   OTA password behavior.
+4. Update without erase: WiFi, device, overlay and night settings survive.
+5. OTA to app1, then browser Update: app0 boots the new version.
+6. Cold power-cycle/USB reconnect: Improv answers during startup, render and
+   sleep.
+7. Wrong chip is refused; chip identity alone cannot distinguish S3 panels.
 
-Resolve the deferred Phase 2 provider-policy/attribution, verified TLS/JSON and
-allocation-failure findings before public distribution. Phase 4 adds the project
-workflow, checksums/release checks, documentation and hub entry; Phase 5 records
-physical acceptance and an intentional release. No erase/upload/tag/push or
-publication was performed in Phase 3.
+v1.5.10 was published 12-10-2026 with these and the deferred Phase 2
+provider-attribution, verified TLS/JSON, PWM allocation and WebUI-auth
+findings still open; they are post-release follow-ups.
