@@ -4,7 +4,7 @@
 
 // Identity shared by startup, WebUI, Improv and installer metadata. Keep the
 // project name stable so ESP Web Tools recognizes a settings-preserving Update.
-#define FIRMWARE_VERSION "1.5.10"
+#define FIRMWARE_VERSION "1.6.0-dev"
 #define IMPROV_SETUP_ENABLED 1
 constexpr const char* PROJECT_NAME = "ESP32S3-Weather";
 constexpr const char* PROJECT_REPO_URL = "https://github.com/anthonyjclarke/ESP32S3-Weather";
