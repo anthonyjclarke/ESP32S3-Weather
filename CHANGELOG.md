@@ -1,6 +1,143 @@
 # Changelog
 
+## [1.5.10] 12-10-2026
+
+### Fixed
+
+- Native USB never enumerated, so the web installer could not reach Improv.
+  The CH422G expander was initialised to `0xFF`, driving EXIO5 (`USB_SEL`)
+  high, which routes GPIO19/20 to the CAN transceiver. EXIO5 is now held low
+  (native USB); all other expander outputs are unchanged.
+
+## [1.5.9] 12-10-2026
+
+### Changed
+
+- Rebrand the local WebUI using the Health App paper/green palette, system
+  typography, white cards and form styling. Dashboard, Settings and System
+  navigation groups the mirror/controls, device/night settings and diagnostics.
+- Keep the running firmware version visible across all sections, preserve data
+  age, cache states, mirror touch and all existing control/API behavior. Add
+  mobile layouts, keyboard focus indicators and a scrollable cache table.
+- Installer board label now includes `7″` so the hub's screen-size filter
+  recognises it.
+
+### Added
+
+- `.github/workflows/firmware.yml` calls the shared cyd-web-installer release
+  workflow, building only `esp32s3-7inch-public`. Pushes produce a
+  `site-preview` artifact; a `v*` tag on `main` publishes the release and
+  installer page.
+
+### Validation
+
+- Browser preview and isolated firmware build results are recorded in the phased
+  plan. Device display, settings persistence and LAN controls still need board
+  acceptance after upload. No display driver or refresh timing changes.
+
+## [1.5.8] 12-10-2026
+
+### Added
+
+- Phase 3 public environment excludes personal secrets even when a local header
+  exists; ordinary builds accept an absent secrets file. Public defaults use
+  Sydney and blank keys/passwords.
+- WebUI Device setup stores location, coordinates, POSIX timezone, OWM key and
+  OTA password in NVS, validates a candidate, then restarts to apply it. Password
+  fields retain existing values when blank; explicit actions clear them. API
+  reads return presence flags only. OTA is disabled without a configured password.
+- Always-on Improv provisioning over native USB Serial/JTAG using the shared
+  installer's patched library, ESP32-S3 identity and a Core 0 listener task.
+  Add malformed-frame bounds checks and restore credentials after failed joins.
+- Public post-build artifacts, identity/hash guard, four-part ESP32-S3 manifest
+  packaging, partition/NVS checks, checksums and web-install runbook.
+
+### Changed
+
+- A literal `FIRMWARE_VERSION` now feeds startup, serial, WebUI, Improv and
+  installer metadata. WebUI shows **Running firmware v1.5.8** in its initial
+  HTML before polling. Runtime location settings drive maps and forecast requests.
+- Keep WebUI mDNS discovery available when OTA is disabled.
+- Replace the hardcoded OHRID map label with LOCATION. Preserve panel timing,
+  partition layout, the pinned LCD interrupt fix and hourly refresh policy.
+- Installer preparation is local only; USB onboarding, update/settings retention
+  and app1 recovery remain pending hardware tests. No firmware published.
+
+## [1.5.7] 12-10-2026
+
+### Fixed
+
+- Phase 2: validate a complete forecast snapshot before publishing it through a
+  FreeRTOS queue. Failed or malformed forecast/radar replies retain last good
+  data; successful forecast age is separate from attempt age in `/api/status`
+  and WebUI. Retry failed weather requests after five minutes while awake.
+- Hourly weather refreshes continue on graph pages; completed map renders do
+  not replace a graph or a sleeping display. Main publishes layer caches after
+  atomic render completion, preserving complete matching maps on tile failure.
+  Capture opacity per render and discard results for changed views.
+- Reject oversized PNG dimensions before decoding into 256-pixel callback
+  buffers; cap tile payloads and body-read duration, and set explicit TLS waits.
+- Handle missing NTP/forecast values safely, normalize calendar-day offsets,
+  and use floating-point graph scaling with a flat-range guard.
+- Serialize touch reset with backlight PWM I2C transactions; check sprite/queue
+  allocations before starting the worker.
+- Escape WebUI hardware metric text, strictly validate sleep times, and respect
+  RainViewer's documented zoom-7 limit. Higher zooms retain the base map.
+
+### Documentation
+
+- Full maintained-source review in `docs/PHASE_2_REVIEW.md`, including deferred
+  findings, installer prerequisites and hardware acceptance checks. Correct
+  task/core ownership and distinguish historical reference behavior.
+- Preserve the pinned LovyanGFX LCD interrupt fix and existing panel timing.
+  Build/native/JavaScript checks do not establish hardware compatibility.
+
+## [1.5.6] 12-10-2026
+
+### Changed
+
+- Phase 1: increase `kRealtimeRefreshSecs` from 1800 to 3600 seconds. Scheduled
+  weather/RainViewer fetches and active-layer refreshes now run hourly while
+  the map page is active. Layer-cache freshness also becomes one hour; radar
+  images may consequently be older. Startup fetching, 30-second layer cycling,
+  forced renders, panel timing, and the pinned LCD interrupt fix are unchanged.
+- Document cache misses and forced-render traffic separately from scheduled
+  refreshes, and note that forecast graph pages defer periodic refreshes.
+
+### Added
+
+- README display example from `images/TFT-Display.jpg` and a WebUI screenshot
+  placeholder describing the browser controls and running-version display.
+
+## [1.5.5] 12-10-2026
+
+### Added
+
+- WebUI shows the running firmware version beside the TFT mirror metadata.
+  `/api/status` exposes `firmwareVersion` from `kFwVersion`, the same source
+  used by the startup screen and serial banner.
+
+### Fixed
+
+- Firmware identity now reports `1.5.5`. It previously stayed at `1.5.2`
+  even though the changelog recorded the subsequent 1.5.3 and 1.5.4 fixes.
+- Blank RGB display after rebuilding with LovyanGFX 1.2.21 on Arduino 3.3.7 /
+  ESP-IDF 5.5. Boot logged `No free interrupt inputs for LCD_CAM interrupt
+  (flags 0x80E)` while touch, WiFi, weather fetches, and map rendering continued.
+  The previous `LovyanGFX@^1.1.16` constraint permitted the affected version;
+  a successful compilation did not verify display operation.
+- Pin LovyanGFX to upstream commit
+  `d504ab71264b8197ede527746fa1a21b5d20e075`, restoring `ESP_INTR_FLAG_SHARED`
+  for the ESP32-S3 RGB LCD_CAM interrupt. The user confirmed display recovery
+  after flashing the corrected build on 12 October 2026. Panel timings,
+  pin assignments, and weather refresh interval were unchanged.
+  Keep the exact dependency pin when rebuilding; the plan document alone
+  cannot change the running firmware. Upstream fix:
+  https://github.com/lovyan03/LovyanGFX/commit/d504ab71264b8197ede527746fa1a21b5d20e075
+
 ## Todo
+- Refresh the WebUI format using the Health App project UI as the design template;
+  see `ENHANCEMENTS.md` and Phase 6 in `CODE_REVIEW_AND_PHASED_PLAN.md`.
 - Add TZ selection in WebUI
 - Tidy up Social status line in WebUI
 - Evaluate free-to-use API alternatives based on current usage in the README
@@ -15,6 +152,19 @@
 - Based on Zoom if data not available then skip display with a status message to advise
 - Evaluate https://github.com/rainviewer/rainviewer-api-example for Zoom details
 
+
+## [1.5.4] 09-10-2026
+
+### Fixed
+
+- `initWiFi()` never detected saved WiFiManager credentials: it tested
+  `WiFi.SSID()`, which is only the network currently joined and is always
+  empty before `autoConnect()`. It now starts the STA driver with
+  `WiFi.mode(WIFI_STA)` and asks `wm.getWiFiIsSaved()`, which reads the stored
+  STA config. Credentials saved through the portal are now used instead of
+  being overwritten by the `secrets.h` pre-seed on every boot, and a board
+  with saved credentials but no `secrets.h` SSID now closes the portal after
+  15 s instead of waiting forever. Port of CYD_PongClock commit `2862967`.
 
 ## [1.5.3] 09-05-2026
 

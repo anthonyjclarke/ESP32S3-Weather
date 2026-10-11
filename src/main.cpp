@@ -8,27 +8,62 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <PNGdec.h>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <atomic>
+#include <freertos/queue.h>
+#include "weather_validation.h"
 #include "time.h"
 #include <Wire.h>
 #include <Preferences.h>
 #include "config.h"
 #include "debug.h"
 #include "display_hw.h"
-#include "secrets.h"
+#include "build_credentials.h"
+#include "device_settings.h"
+#include "improv_setup.h"
 #include "touch.h"
 #include "waveshare_display.h"
 
-#ifndef SECRET_OTA_PASSWORD
-#define SECRET_OTA_PASSWORD "change-me"
-#endif
 
 const char* ntpServer = "pool.ntp.org";
 
-const char* owmApiKey = SECRET_OWM_API_KEY;
+DeviceSettings makeDefaultSettings() {
+  DeviceSettings settings;
+  strlcpy(settings.locationName, cfg::kLocationName, sizeof(settings.locationName));
+  settings.latitude = cfg::kLocationLatitude;
+  settings.longitude = cfg::kLocationLongitude;
+  strlcpy(settings.timezone, cfg::kNtpTimezone, sizeof(settings.timezone));
+  strlcpy(settings.owmKey, SECRET_OWM_API_KEY, sizeof(settings.owmKey));
+  strlcpy(settings.otaPassword, SECRET_OTA_PASSWORD, sizeof(settings.otaPassword));
+  return settings;
+}
+DeviceSettings deviceSettings = makeDefaultSettings();
+const char* owmApiKey = deviceSettings.owmKey;
+bool otaStarted = false;
+uint32_t deviceRebootAt = 0;
+
+void loadDeviceSettings() {
+  Preferences prefs;
+  DeviceSettings saved = {};
+  if (prefs.begin("weatherdev", true)) {
+    if (prefs.getBytesLength("settings") == sizeof(saved) &&
+        prefs.getBytes("settings", &saved, sizeof(saved)) == sizeof(saved)) {
+      // Ensure stored byte arrays are bounded before validating their strings.
+      saved.locationName[sizeof(saved.locationName)-1] = 0;
+      saved.timezone[sizeof(saved.timezone)-1] = 0;
+      saved.owmKey[sizeof(saved.owmKey)-1] = 0;
+      saved.otaPassword[sizeof(saved.otaPassword)-1] = 0;
+      if (validDeviceSettings(saved)) deviceSettings = saved;
+      else DBG_WARN("Device settings invalid; using build defaults");
+    }
+    prefs.end();
+  }
+}
+
 
 int myZoom = cfg::kMapZoom;
 double myLat = cfg::kLocationLatitude;
@@ -39,7 +74,7 @@ int appState = 0;
 int lastMinute = -1;
 int mapStyle = cfg::kDefaultMapStyle;   // 0 = dark_all, 1 = opentopomap, 2 = openstreetmap
 int layerStyle = 0; // 0 = Radar, 1 = Clouds, 2 = Rain
-bool owmAuthFailed = false;
+std::atomic<bool> owmAuthFailed{false};
 bool otaInProgress = false;
 
 String radarHost = "https://tilecache.rainviewer.com";
@@ -76,14 +111,19 @@ struct LayerCacheState {
   int zoom;
   int mapStyle;
   unsigned long updatedMs;
+  unsigned long lastAttemptMs;
+  bool degraded;
 };
 
 LayerCacheState layerCaches[3] = {};
 
 enum RenderState : uint8_t { RENDER_IDLE, RENDER_BUSY, RENDER_READY };
-volatile RenderState renderState = RENDER_IDLE;
+std::atomic<RenderState> renderState{RENDER_IDLE};
+bool renderSucceeded = false;
+bool renderCompletionPending = false;
+int renderAlphaPercent = 100;
 volatile bool renderPending        = false;
-volatile bool weatherRefreshPending = false;
+std::atomic<bool> weatherRefreshPending{false};
 bool          firstRenderDone = false;
 unsigned long layerCycleLastMs = 0;
 unsigned long realtimeRefreshLastMs = 0;
@@ -134,6 +174,54 @@ int morningCode, noonCode, eveningCode;
 float dMax[16], dMin[16], dRain[16], dPress[16], dCloud[16];
 float dHum[16], dWind[16], dUV[16], dSolar[16];
 int dCode[16];
+
+struct WeatherUpdate {
+  ForecastData forecast;
+  bool forecastOk;
+  bool radarOk;
+  unsigned long completedMs;
+};
+QueueHandle_t weatherUpdateQueue = nullptr;
+bool weatherHasData = false;
+bool radarHasData = false;
+bool weatherInFlight = false;
+bool weatherRetryNeeded = false;
+bool weatherDataChanged = false;
+unsigned long radarLastSuccessMs = 0;
+
+void applyWeatherUpdate(const WeatherUpdate& update) {
+  weatherInFlight = false;
+  weatherRetryNeeded = !update.forecastOk || !update.radarOk;
+  if (update.radarOk) {
+    radarHasData = true;
+    radarLastSuccessMs = update.completedMs;
+  }
+  if (!update.forecastOk) return;
+  const ForecastData& next = update.forecast;
+  currentTemp = next.currentTemp;
+  morningTemp = next.morningTemp;
+  noonTemp = next.noonTemp;
+  eveningTemp = next.eveningTemp;
+  morningCode = next.morningCode;
+  noonCode = next.noonCode;
+  eveningCode = next.eveningCode;
+#define COPY_FORECAST_ARRAY(name) memcpy(name, next.name, sizeof(name))
+  COPY_FORECAST_ARRAY(dMax); COPY_FORECAST_ARRAY(dMin); COPY_FORECAST_ARRAY(dRain);
+  COPY_FORECAST_ARRAY(dPress); COPY_FORECAST_ARRAY(dCloud); COPY_FORECAST_ARRAY(dHum);
+  COPY_FORECAST_ARRAY(dWind); COPY_FORECAST_ARRAY(dUV); COPY_FORECAST_ARRAY(dSolar);
+  COPY_FORECAST_ARRAY(dCode);
+#undef COPY_FORECAST_ARRAY
+  lastUpdate = update.completedMs;
+  weatherHasData = true;
+  weatherDataChanged = true;
+}
+
+void consumeWeatherUpdate() {
+  WeatherUpdate update;
+  if (weatherUpdateQueue && xQueueReceive(weatherUpdateQueue, &update, 0) == pdTRUE) {
+    applyWeatherUpdate(update);
+  }
+}
 
 void getWeatherData();
 void renderRadarMap();
@@ -402,10 +490,7 @@ int pngDrawCanvas(PNGDRAW *pDraw) {
 int pngDrawOverlayCanvas(PNGDRAW *pDraw) {
   uint16_t pix[256];
   png.getLineAsRGB565(pDraw, pix, PNG_RGB565_LITTLE_ENDIAN, 0);
-  int alphaPercent = 100;
-  if (renderLayerStyle >= 0 && renderLayerStyle < 3) {
-    alphaPercent = constrain(overlayAlphaPercent[renderLayerStyle], 0, 100);
-  }
+  const int alphaPercent = renderAlphaPercent;
 
   for (int x = 0; x < pDraw->iWidth; x++) {
     uint16_t c = pix[x];
@@ -429,9 +514,11 @@ int pngDrawOverlayCanvas(PNGDRAW *pDraw) {
 
 size_t readHttpPayload(WiFiClient* stream, uint8_t* buf, size_t expectedLen, uint32_t timeoutMs) {
   size_t total = 0;
-  unsigned long lastProgress = millis();
+  const unsigned long startedMs = millis();
+  unsigned long lastProgress = startedMs;
 
-  while (total < expectedLen && (millis() - lastProgress < timeoutMs)) {
+  while (total < expectedLen && (millis() - lastProgress < timeoutMs) &&
+         (millis() - startedMs < 30000UL)) {
     int available = stream->available();
     if (available <= 0) {
       delay(1);
@@ -507,7 +594,7 @@ bool layerCacheMatches(int targetLayer) {
 }
 
 bool layerCacheFresh(int targetLayer) {
-  if (!layerCacheMatches(targetLayer)) return false;
+  if (!layerCacheMatches(targetLayer) || layerCaches[targetLayer].degraded) return false;
   unsigned long ageMs = millis() - layerCaches[targetLayer].updatedMs;
   return ageMs < (unsigned long)cfg::kRealtimeRefreshSecs * 1000UL;
 }
@@ -518,12 +605,14 @@ void invalidateLayerCaches() {
   }
 }
 
-void markLayerCacheUpdated(int targetLayer) {
+void markLayerCacheUpdated(int targetLayer, bool complete = true) {
   if (targetLayer < 0 || targetLayer > 2) return;
   layerCaches[targetLayer].valid = true;
   layerCaches[targetLayer].zoom = renderZoom;
   layerCaches[targetLayer].mapStyle = renderMapStyle;
   layerCaches[targetLayer].updatedMs = millis();
+  layerCaches[targetLayer].lastAttemptMs = millis();
+  layerCaches[targetLayer].degraded = !complete;
 }
 
 unsigned long layerCacheAgeSecs(int targetLayer) {
@@ -540,6 +629,11 @@ void formatLayerAgeLabel(int targetLayer, char* out, size_t outLen) {
 
   if (targetLayer < 0 || targetLayer > 2) {
     strlcpy(out, "--", outLen);
+    return;
+  }
+
+  if (targetLayer == 0 && myZoom > cfg::kRadarMaxZoom) {
+    strlcpy(out, "radar max z7", outLen);
     return;
   }
 
@@ -573,6 +667,7 @@ void formatLayerAgeLabel(int targetLayer, char* out, size_t outLen) {
 uint16_t layerAgeColor(int targetLayer) {
   if (targetLayer < 0 || targetLayer > 2) return TFT_DARKGREY;
   if (layerCacheMatches(targetLayer)) {
+    if (layerCaches[targetLayer].degraded) return TFT_RED;
     unsigned long ageSecs = layerCacheAgeSecs(targetLayer);
     unsigned long refreshSecs = (unsigned long)cfg::kRealtimeRefreshSecs;
     if (ageSecs >= refreshSecs) return TFT_RED;
@@ -590,7 +685,7 @@ void markScreenUpdated() {
 }
 
 const char* renderStateName() {
-  switch (renderState) {
+  switch (renderState.load()) {
     case RENDER_IDLE:  return "idle";
     case RENDER_BUSY:  return "busy";
     case RENDER_READY: return "ready";
@@ -603,6 +698,8 @@ String layerCacheStatusName(int layer) {
   if (renderPending && pendingLayerStyle == layer) return "queued";
   if (!layerCaches[layer].valid) return "missing";
   if (!layerCacheMatches(layer)) return "mismatch";
+  if (layer == 0 && myZoom > cfg::kRadarMaxZoom) return "unsupported";
+  if (layerCaches[layer].degraded) return "degraded";
   if (!layerCacheFresh(layer)) return "stale";
   return "fresh";
 }
@@ -633,6 +730,7 @@ String buildStatusJson() {
   json.reserve(2800);
   json += "{";
   json += "\"frameVersion\":" + String((uint32_t)screenFrameVersion);
+  json += ",\"firmwareVersion\":\"" + jsonEscape(String(kFwVersion)) + "\"";
   json += ",\"uptimeMs\":" + String(millis());
   json += ",\"appState\":" + String(appState);
   json += ",\"layer\":\"" + String(layerNames[layerStyle]) + "\"";
@@ -642,7 +740,14 @@ String buildStatusJson() {
   json += ",\"renderLayer\":\"" + String(layerNames[renderLayerStyle]) + "\"";
   json += ",\"renderTilesDone\":" + String((int)renderTilesDone);
   json += ",\"renderTilesTotal\":" + String((int)renderTilesTotal);
-  json += ",\"lastUpdateAgeSec\":" + String((millis() - lastUpdate) / 1000UL);
+  json += ",\"lastUpdateAgeSec\":" + (weatherHasData ? String((millis() - lastUpdate) / 1000UL) : String("null"));
+  json += ",\"weather\":{\"hasData\":" + String(weatherHasData ? "true" : "false");
+  json += ",\"refreshing\":" + String(weatherInFlight ? "true" : "false");
+  json += ",\"retryNeeded\":" + String(weatherRetryNeeded ? "true" : "false");
+  json += ",\"lastAttemptAgeSec\":" + String((millis() - realtimeRefreshLastMs) / 1000UL);
+  json += ",\"radarHasData\":" + String(radarHasData ? "true" : "false");
+  json += ",\"radarAgeSec\":" + (radarHasData ? String((millis() - radarLastSuccessMs) / 1000UL) : String("null"));
+  json += "}";
   json += ",\"refreshSec\":" + String(cfg::kRealtimeRefreshSecs);
   json += ",\"overlayAlpha\":{";
   json += "\"radar\":" + String(overlayAlphaPercent[0]);
@@ -721,136 +826,67 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ESP32S3 Weather</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #071014;
-      --panel: rgba(18, 31, 38, .82);
-      --panel-strong: rgba(24, 43, 52, .95);
-      --line: rgba(166, 205, 218, .18);
-      --text: #edf8fb;
-      --muted: #94aeb7;
-      --accent: #4dd5ff;
-      --accent2: #86efac;
-      --warn: #f7cf6a;
-      --bad: #fb7185;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      padding: 28px 18px;
-      background:
-        radial-gradient(circle at 12% 8%, rgba(77, 213, 255, .18), transparent 32%),
-        radial-gradient(circle at 82% 10%, rgba(134, 239, 172, .13), transparent 30%),
-        linear-gradient(160deg, #071014 0%, #10242c 58%, #091216 100%);
-    }
-    main { width: min(1120px, 100%); margin: 0 auto; }
-    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 0 0 18px; }
-    h1 { font-size: clamp(22px, 3vw, 34px); margin: 0; letter-spacing: 0; }
-    .sub { margin: 5px 0 0; color: var(--muted); font-size: 14px; }
-    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; color: var(--muted); background: rgba(255,255,255,.04); font-size: 13px; white-space: nowrap; }
-    .mirror-wrap {
-      background: #000;
-      border: 1px solid rgba(255,255,255,.24);
-      border-radius: 12px;
-      width: min(800px, 100%);
-      line-height: 0;
-      overflow: hidden;
-      box-shadow: 0 24px 80px rgba(0,0,0,.42), 0 0 0 1px rgba(77,213,255,.06);
-    }
-    #mirror { width: 100%; height: auto; image-rendering: auto; cursor: crosshair; user-select: none; }
-    .meta { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 18px; color: var(--muted); font-size: 13px; }
-    .meta span { border: 1px solid var(--line); background: rgba(255,255,255,.045); border-radius: 999px; padding: 7px 10px; }
-    .grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; align-items: start; }
-    .card {
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: var(--panel);
-      backdrop-filter: blur(16px);
-      box-shadow: 0 14px 44px rgba(0,0,0,.24);
-      padding: 16px;
-    }
-    .card h2 { margin: 0 0 12px; font-size: 15px; letter-spacing: 0; }
-    .control { display: grid; grid-template-columns: 104px 1fr 58px; gap: 12px; align-items: center; margin: 12px 0; }
-    .control label { color: var(--muted); font-size: 13px; }
-    output { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
-    input[type=range] { width: 100%; accent-color: var(--accent); }
-    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
-    button {
-      border: 1px solid var(--line);
-      border-radius: 9px;
-      background: rgba(255,255,255,.07);
-      color: var(--text);
-      padding: 10px 12px;
-      font: inherit;
-      cursor: pointer;
-    }
-    button:hover { border-color: rgba(77,213,255,.55); background: rgba(77,213,255,.12); }
-    button.danger:hover { border-color: rgba(251,113,133,.7); background: rgba(251,113,133,.14); }
-    table { border-collapse: collapse; width: 100%; font-size: 13px; }
-    th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; }
-    th { color: var(--muted); font-weight: 650; }
-    .fresh { color: var(--accent2); }
-    .stale, .queued, .updating { color: var(--warn); }
-    .missing, .mismatch { color: var(--bad); }
-    .hw { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .metric { border: 1px solid var(--line); background: rgba(255,255,255,.045); border-radius: 10px; padding: 10px; min-width: 0; }
-    .metric .k { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-    .metric .v { display: block; overflow-wrap: anywhere; font-size: 14px; font-variant-numeric: tabular-nums; }
-    footer { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin:24px 0 0; padding-top:16px; border-top:1px solid var(--line); font-size:13px; color:var(--muted); }
-    .footer-social { display:flex; gap:10px; align-items:center; }
-    .social-link { display:inline-flex; align-items:center; gap:7px; color:var(--muted); padding:5px 12px; border-radius:20px; border:1px solid var(--line); transition:color .2s,border-color .2s,background .2s; font-size:13px; text-decoration:none; }
-    .social-link:hover { color:#fff; border-color:#7dd3fc; background:rgba(125,211,252,.1); text-decoration:none; }
-    .social-link svg { flex-shrink:0; }
-    a { color: #7dd3fc; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } header { align-items: start; flex-direction: column; } .hw { grid-template-columns: 1fr; } }
-    .zoom-arrow { color: var(--muted); font-size: 11px; }
-    .sched-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 0; border-bottom:1px solid var(--line); }
-    .sched-row:last-child { border-bottom:none; }
-    .sched-row > label:first-child { color:var(--muted); font-size:13px; flex:1; }
-    .toggle { position:relative; display:inline-block; width:40px; height:22px; flex-shrink:0; }
-    .toggle input { opacity:0; width:0; height:0; position:absolute; }
-    .slider { position:absolute; cursor:pointer; inset:0; background:#334155; border-radius:22px; transition:.2s; }
-    .slider:before { content:''; position:absolute; height:16px; width:16px; left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.2s; }
-    .toggle input:checked + .slider { background:var(--accent); }
-    .toggle input:checked + .slider:before { transform:translateX(18px); }
-    .time-input { background:var(--panel-strong); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 8px; font:inherit; font-size:13px; width:100px; }
-    .time-input:focus { outline:none; border-color:var(--accent); }
-    .sched-status { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.7; }
+    :root { color-scheme:light; --text:#203d35; --muted:#6b7c74; --accent:#266957; --accent2:#266957; --bg:#f3f4ef; --panel:#fff; --line:#dde3dc; --warn:#856019; --bad:#963e27; font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--text); background:var(--bg); }
+    * { box-sizing:border-box; } body { margin:0; } main { max-width:1320px; margin:auto; padding:40px 42px; }
+    header { display:flex; justify-content:space-between; align-items:center; gap:24px; margin-bottom:24px; }
+    h1 { font-size:clamp(30px,4vw,44px); letter-spacing:-1.7px; font-weight:650; margin:0; } h2 { font-size:22px; letter-spacing:-.5px; margin:0 0 14px; }
+    .eyebrow { color:var(--muted); font-size:11px; font-weight:750; letter-spacing:2px; margin:0 0 8px; } .sub,.dim { color:var(--muted); } .sub { margin:5px 0; } .dim { font-size:13px; }
+    .header-meta,.meta,.actions,.footer-social { display:flex; align-items:center; gap:10px; flex-wrap:wrap; } .header-meta { justify-content:flex-end; }
+    .pill { padding:8px 12px; border:1px solid var(--line); border-radius:7px; background:#e4ece2; font-size:13px; overflow-wrap:anywhere; }
+    nav { display:flex; gap:8px; border-bottom:1px solid var(--line); padding-bottom:16px; margin-bottom:22px; }
+    button,input { font:inherit; } button { border:1px solid var(--accent); border-radius:7px; background:var(--accent); color:white; padding:10px 15px; cursor:pointer; min-height:44px; }
+    button:hover { filter:brightness(.94); } button:disabled { opacity:.5; cursor:default; }
+    nav button { background:transparent; color:var(--accent); border-color:transparent; } nav button[aria-pressed=true] { background:var(--accent); color:white; }
+    button.danger { background:#fff0e9; border-color:#e9c9bc; color:var(--bad); }
+    :focus-visible { outline:3px solid #84a795; outline-offset:3px; } [hidden] { display:none!important; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.7fr) minmax(300px,1fr); gap:20px; align-items:start; } .settings-grid { grid-template-columns:minmax(0,1.7fr) minmax(300px,1fr); }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:24px; min-width:0; }
+    .overview { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin-bottom:20px; }
+    .summary { border-top:3px solid #84a795; border-radius:8px; background:white; padding:16px 20px; } .summary small { display:block; color:var(--muted); font-size:12px; } .summary strong { display:block; font-size:20px; margin-top:6px; overflow-wrap:anywhere; }
+    .mirror-wrap { background:#000; border:1px solid var(--line); border-radius:7px; max-width:800px; line-height:0; overflow:hidden; } #mirror { width:100%; height:auto; cursor:crosshair; user-select:none; display:block; }
+    .meta { font-size:12px; color:var(--muted); margin-top:14px; } .meta strong { color:var(--text); } #touchResult { min-height:20px; margin-bottom:0; }
+    .control { display:grid; grid-template-columns:105px minmax(0,1fr) 42px; gap:10px; align-items:center; margin:18px 0; } .control label { font-size:13px; color:var(--muted); }
+    input[type=range] { width:100%; min-width:0; min-height:32px; accent-color:var(--accent); margin:0; padding:0; } output { text-align:right; font-variant-numeric:tabular-nums; font-size:13px; }
+    .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; } .form-grid label { font-size:12px; color:var(--muted); } .wide { grid-column:1/-1; }
+    input:not([type=checkbox]):not([type=range]) { background:white; border:1px solid #cbd5cc; border-radius:6px; color:var(--text); padding:10px; width:100%; min-height:44px; margin-top:5px; }
+    .check { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:13px; margin:14px 0; } input[type=checkbox] { accent-color:var(--accent); width:18px; height:18px; flex-shrink:0; }
+    .actions { margin-top:18px; } #deviceResult { background:#e4ece2; border:1px solid #d3dfd0; padding:10px 14px; border-radius:7px; }
+    .sched-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 0; border-bottom:1px solid var(--line); } .sched-row>label:first-child { font-size:13px; color:var(--muted); }
+    .sched-row .time-input { width:145px!important; margin:0!important; } .sched-status { font-size:13px; color:var(--muted); margin:12px 0; line-height:1.8; }
+    .toggle { position:relative; display:inline-block; width:44px; height:26px; flex-shrink:0; } .toggle input { opacity:0; position:absolute; inset:0; width:100%; height:100%; margin:0; }
+    .slider { position:absolute; pointer-events:none; inset:0; background:#cbd5cc; border-radius:26px; } .slider:before { content:''; position:absolute; width:20px; height:20px; left:3px; top:3px; background:white; border-radius:50%; }
+    .toggle input:checked+.slider { background:var(--accent); } .toggle input:checked+.slider:before { transform:translateX(18px); } .toggle input:focus-visible+.slider { outline:3px solid #84a795; outline-offset:3px; }
+    .table-wrap { overflow-x:auto; } table { border-collapse:collapse; width:100%; font-size:13px; white-space:nowrap; } th,td { text-align:left; padding:10px 12px; border-bottom:1px solid #edf0e9; } th { font-weight:600; color:var(--muted); background:#f7f9f5; }
+    .fresh { color:var(--accent2); } .stale,.queued,.updating { color:var(--warn); } .bad,.missing,.mismatch,.degraded,.unsupported { color:var(--bad); } .zoom-arrow { color:var(--muted); font-size:11px; }
+    .hw { display:grid; grid-template-columns:1fr 1fr; gap:10px; } .metric { border:1px solid var(--line); border-radius:7px; padding:12px; min-width:0; } .metric .k { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; } .metric .v { display:block; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; font-size:14px; }
+    footer { display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-top:30px; padding-top:18px; border-top:1px solid var(--line); font-size:12px; color:var(--muted); } a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; } .social-link { display:inline-flex; align-items:center; gap:7px; } .social-link svg { flex-shrink:0; }
+    @media(max-width:900px) { .grid { grid-template-columns:1fr; } main { padding:24px 16px; } .card { padding:18px; } header { align-items:flex-start; flex-direction:column; } .header-meta { justify-content:flex-start; } .overview { grid-template-columns:1fr 1fr; } }
+    @media(max-width:480px) { .form-grid,.hw { grid-template-columns:1fr; } .summary { padding:13px; } .summary strong { font-size:17px; } nav { gap:3px; } nav button { padding:10px 12px; } .control { grid-template-columns:95px minmax(0,1fr) 38px; gap:8px; } }
   </style>
 </head>
 <body>
   <main>
     <header>
-      <div>
-        <h1>ESP32S3 Weather</h1>
-        <p class="sub">Live TFT mirror, cache telemetry, and LAN controls.</p>
-      </div>
-      <div class="pill" id="ipPill">LAN</div>
+      <div><p class="eyebrow">LOCAL WEATHER / LIVE DISPLAY</p><h1>ESP32S3 Weather</h1><p class="sub">Your weather dashboard, at a glance.</p></div>
+      <div class="header-meta"><span class="pill">Running firmware <strong id="firmwareVersion">v)HTML" FIRMWARE_VERSION R"HTML(</strong></span><span class="pill" id="ipPill">LAN</span></div>
     </header>
-    <div class="mirror-wrap"><img id="mirror" src="/screen.bmp?v=0" width="800" height="480" alt="TFT mirror"></div>
-    <div class="meta">
-      <span>Frame <strong id="frame">0</strong></span>
-      <span>Layer <strong id="layer">--</strong></span>
-      <span>Map <strong id="map">--</strong></span>
-      <span>Zoom <strong id="zoom">--</strong></span>
-      <span>Render <strong id="render">--</strong></span>
-      <span class="dim" id="touchResult"></span>
-    </div>
-    <div class="grid">
-      <section class="card">
-        <h2>Layer Cache</h2>
-        <table>
-          <thead><tr><th>Layer</th><th>Status</th><th>Age</th><th>Cached At</th><th>Cache Map</th></tr></thead>
-          <tbody id="layers"></tbody>
-        </table>
-      </section>
-      <section class="card">
-        <h2>Controls</h2>
+    <nav aria-label="Dashboard sections">
+      <button type="button" data-page="dashboard" aria-controls="dashboard" aria-pressed="true">Dashboard</button>
+      <button type="button" data-page="settings" aria-controls="settings" aria-pressed="false">Settings</button>
+      <button type="button" data-page="system" aria-controls="system" aria-pressed="false">System</button>
+    </nav>
+    <section id="dashboard" aria-label="Dashboard">
+      <div class="overview">
+        <div class="summary"><small>Weather data</small><strong id="weatherAge">--</strong></div>
+        <div class="summary"><small>Active layer</small><strong id="layer">--</strong></div>
+        <div class="summary"><small>Map style</small><strong id="map">--</strong></div>
+        <div class="summary"><small>Zoom level</small><strong id="zoom">--</strong></div>
+      </div>
+      <div class="grid"><section class="card"><h2>Live display</h2><p class="dim">Tap the mirror to use the dashboard's touch controls.</p>
+        <div class="mirror-wrap"><img id="mirror" src="/screen.bmp?v=0" width="800" height="480" alt="Live weather display; tap to control the dashboard"></div>
+        <div class="meta"><span>Frame <strong id="frame">0</strong></span><span>Render <strong id="render">--</strong></span></div><p id="touchResult" class="dim" role="status"></p>
+      </section><section class="card">
+        <h2>Map controls</h2><p class="dim">Adjust the display zoom and weather overlays.</p>
         <div class="control">
           <label for="zoomControl">Zoom</label>
           <input id="zoomControl" type="range" min="5" max="12" step="1" value="7">
@@ -871,16 +907,25 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <input id="rainAlphaControl" type="range" min="0" max="100" step="1" value="50">
           <output id="rainAlphaOut">50%</output>
         </div>
-      </section>
-      <section class="card">
-        <h2>Hardware</h2>
-        <div class="hw" id="hardware"></div>
-        <div class="actions">
-          <button id="rebootBtn" class="danger">Reboot</button>
-          <button id="resetWifiBtn" class="danger">Reset WiFi Settings</button>
-        </div>
-      </section>
-      <section class="card">
+      </section></div>
+    </section>
+    <section id="settings" aria-label="Settings" hidden><div class="grid settings-grid"><section class="card">
+      <h2>Device setup</h2>
+      <p class="dim">Set your location and POSIX timezone. Saving restarts the dashboard.</p>
+      <form id="deviceForm" >
+        <div class="form-grid"><label class="wide">Location name <input id="deviceLocation" maxlength="63" required></label>
+        <label>Latitude <input id="deviceLat" type="number" step="any" min="-85.05112878" max="85.05112878" required></label>
+        <label>Longitude <input id="deviceLon" type="number" step="any" min="-180" max="180" required></label>
+        <label class="wide">POSIX timezone <input id="deviceTimezone" maxlength="95" required></label>
+        <label>New OpenWeatherMap key <input id="deviceOwm" type="password" maxlength="128" autocomplete="new-password"></label>
+        <label>New OTA password <input id="deviceOta" type="password" maxlength="63" autocomplete="new-password"></label>
+        </div><label class="check"><input id="clearOwm" type="checkbox"> Clear saved OWM key</label>
+        <label class="check"><input id="clearOta" type="checkbox"> Disable OTA and clear its password</label>
+        <div class="actions"><button id="deviceSave" type="submit" disabled>Save and restart</button></div>
+      </form>
+      <p class="dim">Leave password fields blank to retain existing values. Values are never returned to the browser. Use a trusted local network.</p>
+      <p id="deviceResult" role="status" class="dim">Loading device settings...</p>
+    </section><section class="card">
         <h2>Night Schedule</h2>
         <div class="sched-row">
           <label for="sleepEnabled">Enable schedule</label>
@@ -904,8 +949,21 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
           <label for="sleepForcedEl">Force sleep now</label>
           <label class="toggle"><input id="sleepForcedEl" type="checkbox"><span class="slider"></span></label>
         </div>
-      </section>
-    </div>
+      </section></div></section>
+    <section id="system" aria-label="System" hidden><div class="grid"><section class="card">
+        <h2>Layer Cache</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Layer</th><th>Status</th><th>Age</th><th>Cached At</th><th>Cache Map</th></tr></thead>
+          <tbody id="layers"></tbody>
+        </table></div>
+      </section><section class="card">
+        <h2>Hardware</h2>
+        <div class="hw" id="hardware"></div>
+        <div class="actions">
+          <button id="rebootBtn" class="danger">Reboot</button>
+          <button id="resetWifiBtn" class="danger">Reset WiFi Settings</button>
+        </div>
+      </section></div></section>
     <footer>
       <span>Based on work by <a href="https://www.hackster.io/mircemk" target="_blank" rel="noopener">Mirko Pavleski</a> &mdash; adapted by Anthony Clarke</span>
       <div class="footer-social">
@@ -921,6 +979,15 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     </footer>
   </main>
   <script>
+    document.querySelectorAll('nav button[data-page]').forEach(button => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('nav button[data-page]').forEach(item => {
+          const selected = item === button;
+          item.setAttribute('aria-pressed', String(selected));
+          document.getElementById(item.dataset.page).hidden = !selected;
+        });
+      });
+    });
     const mirror = document.getElementById('mirror');
     const zoomControl = document.getElementById('zoomControl');
     const radarAlphaControl = document.getElementById('radarAlphaControl');
@@ -944,11 +1011,19 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     function text(id, value) { document.getElementById(id).textContent = value; }
     function kb(v) { return `${Math.round(v / 1024)} KB`; }
 
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+    }
     function metric(label, value) {
-      return `<div class="metric"><span class="k">${label}</span><span class="v">${value}</span></div>`;
+      return `<div class="metric"><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(value)}</span></div>`;
     }
 
     function drawStatus(s) {
+      text('firmwareVersion', s.firmwareVersion ? `v${s.firmwareVersion}` : '--');
+      const w = s.weather;
+      const age = s.lastUpdateAgeSec;
+      const weatherLabel = !w || !w.hasData ? 'unavailable' : `${Math.floor(age / 60)}m old`;
+      text('weatherAge', weatherLabel + (w && w.refreshing ? ' · refreshing' : w && w.retryNeeded ? ' · retry pending' : ''));
       text('frame', s.frameVersion);
       text('layer', s.layer);
       text('map', s.map);
@@ -1107,6 +1182,46 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     });
     sleepForcedEl.addEventListener('change', () => setConfig({ sleepForce: sleepForcedEl.checked }));
 
+    async function loadDeviceSettings() {
+      const message = document.getElementById('deviceResult');
+      try {
+        const response = await fetch('/api/device', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Device settings unavailable');
+        const settings = await response.json();
+        document.getElementById('deviceLocation').value = settings.locationName;
+        document.getElementById('deviceLat').value = settings.latitude;
+        document.getElementById('deviceLon').value = settings.longitude;
+        document.getElementById('deviceTimezone').value = settings.timezone;
+        message.textContent = `OWM key: ${settings.hasOwmKey ? 'set' : 'not set'} · OTA: ${settings.otaEnabled ? 'enabled' : 'disabled'}`;
+        document.getElementById('deviceSave').disabled = false;
+        text('firmwareVersion', `v${settings.firmwareVersion}`);
+      } catch (error) { message.textContent = error.message; }
+    }
+    document.getElementById('deviceForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = document.getElementById('deviceSave');
+      const message = document.getElementById('deviceResult');
+      const value = id => document.getElementById(id).value;
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/device', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            locationName: value('deviceLocation'), latitude: Number(value('deviceLat')),
+            longitude: Number(value('deviceLon')), timezone: value('deviceTimezone'),
+            owmKey: value('deviceOwm'), otaPassword: value('deviceOta'),
+            clearOwmKey: document.getElementById('clearOwm').checked,
+            clearOtaPassword: document.getElementById('clearOta').checked
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || 'Save failed');
+        document.getElementById('deviceOwm').value = '';
+        document.getElementById('deviceOta').value = '';
+        message.textContent = 'Saved. Restarting; reload this page when the device reconnects.';
+      } catch (error) { message.textContent = error.message; button.disabled = false; }
+    });
+    loadDeviceSettings();
     poll();
     setInterval(poll, 1000);
   </script>
@@ -1193,6 +1308,8 @@ void handleWebTouch() {
 static bool parseHHMM(const String& s, int& h, int& m) {
   int colon = s.indexOf(':');
   if (colon < 1 || colon >= (int)s.length() - 1) return false;
+  if (s.length() != 5 || colon != 2 || !isDigit(s[0]) || !isDigit(s[1]) ||
+      !isDigit(s[3]) || !isDigit(s[4])) return false;
   h = s.substring(0, colon).toInt();
   m = s.substring(colon + 1).toInt();
   return h >= 0 && h <= 23 && m >= 0 && m <= 59;
@@ -1346,6 +1463,52 @@ void handleWebConfig() {
   webServer.send(200, "application/json", String("{\"ok\":true,\"changed\":") + (changed ? "true" : "false") + "}");
 }
 
+void handleWebDeviceSettings() {
+  webServer.sendHeader("Cache-Control", "no-store");
+  StaticJsonDocument<768> doc;
+  doc["firmwareVersion"] = kFwVersion;
+  doc["project"] = PROJECT_NAME;
+  doc["locationName"] = deviceSettings.locationName;
+  doc["latitude"] = deviceSettings.latitude;
+  doc["longitude"] = deviceSettings.longitude;
+  doc["timezone"] = deviceSettings.timezone;
+  doc["hasOwmKey"] = deviceSettings.owmKey[0] != 0;
+  doc["hasOtaPassword"] = deviceSettings.otaPassword[0] != 0;
+  doc["otaEnabled"] = otaStarted;
+  String body;
+  serializeJson(doc, body);
+  webServer.send(200, "application/json", body);
+}
+
+void handleWebSaveDeviceSettings() {
+  if (!webServer.hasArg("plain") || webServer.arg("plain").length() > 1536) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing or oversized body\"}");
+    return;
+  }
+  StaticJsonDocument<2048> doc;
+  DeviceSettings candidate;
+  if (deserializeJson(doc, webServer.arg("plain")) ||
+      !deviceSettingsCandidate(doc.as<JsonVariantConst>(), deviceSettings, candidate)) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid settings: check coordinates, text lengths and credential actions\"}");
+    return;
+  }
+  Preferences prefs;
+  if (!prefs.begin("weatherdev", false)) {
+    webServer.send(500, "application/json", "{\"ok\":false,\"error\":\"Settings storage unavailable\"}");
+    return;
+  }
+  const bool saved = prefs.putBytes("settings", &candidate, sizeof(candidate)) == sizeof(candidate);
+  prefs.end();
+  if (!saved) {
+    webServer.send(500, "application/json", "{\"ok\":false,\"error\":\"Settings save failed\"}");
+    return;
+  }
+  // Apply after a restart so network/render readers never observe mixed config.
+  webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+  deviceRebootAt = millis() + 1000UL;
+  if (!deviceRebootAt) deviceRebootAt = 1;
+}
+
 void handleWebReboot() {
   webServer.send(200, "application/json", "{\"ok\":true,\"action\":\"reboot\"}");
   delay(200);
@@ -1374,11 +1537,19 @@ void setupWebUi(bool wifiOk) {
   webServer.on("/api/touch", HTTP_POST, handleWebTouch);
   webServer.on("/api/touch", HTTP_GET, handleWebTouch);
   webServer.on("/api/config", HTTP_POST, handleWebConfig);
+  webServer.on("/api/device", HTTP_GET, handleWebDeviceSettings);
+  webServer.on("/api/device", HTTP_POST, handleWebSaveDeviceSettings);
   webServer.on("/api/reboot", HTTP_POST, handleWebReboot);
   webServer.on("/api/reset-wifi", HTTP_POST, handleWebResetWifi);
   webServer.onNotFound([]() {
     webServer.send(404, "text/plain", "Not found");
   });
+  // OTA starts mDNS when enabled. Public devices still need the WebUI hostname
+  // before an OTA password has been set.
+  if (!otaStarted && !MDNS.begin(cfg::kOtaHostname)) {
+    DBG_WARN("WebUI mDNS unavailable; use the device IP address");
+  }
+  MDNS.addService("http", "tcp", 80);
   webServer.begin();
   webUiStarted = true;
   DBG_INFO("WebUI ready | http://%s/", WiFi.localIP().toString().c_str());
@@ -1422,7 +1593,8 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
   // http.begin(url) creates an internal client with no timeout — fatal when heap is fragmented.
   WiFiClientSecure secClient;
   secClient.setInsecure();
-  secClient.setTimeout(15);  // seconds — caps TLS handshake + stream read
+  secClient.setTimeout(15000); // stream timeout in milliseconds
+  secClient.setHandshakeTimeout(15); // TLS handshake timeout in seconds
 
   HTTPClient http;
   http.setTimeout(15000);
@@ -1473,9 +1645,11 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     }
 
     size_t total = 0;
-    unsigned long t0 = millis();
+    const unsigned long bodyStartedMs = millis();
+    unsigned long t0 = bodyStartedMs;
 
-    while (http.connected() && (millis() - t0 < 15000)) {
+    while ((http.connected() || stream->available()) && (millis() - t0 < 15000) &&
+           (millis() - bodyStartedMs < 30000UL)) {
       while (stream->available()) {
         if (total >= maxChunkedSize) {
           DBG_WARN("Chunked payload too large");
@@ -1507,6 +1681,11 @@ bool fetchPngToBuffer(const String& url, uint8_t** outBuf, size_t* outLen, int* 
     return true;
   }
 
+  if (len > 100000) {
+    DBG_WARN("Tile payload too large: %d bytes", len);
+    http.end();
+    return false;
+  }
   uint8_t* buf = (uint8_t*)ps_malloc(len);
   if (!buf) {
     DBG_ERROR("PSRAM alloc failed: %d bytes", len);
@@ -1567,13 +1746,16 @@ void drawSignature() {
 
   lcd.fillRect(35, 388, 80, 22, panelColor);
   lcd.drawRect(35, 388, 80, 22, TFT_WHITE);
-  lcd.drawString("OHRID", 35 + 40, 388 + 11);
+  lcd.drawString("LOCATION", 35 + 40, 388 + 11);
   markScreenUpdated();
 }
 
 static bool initWiFi() {
   WiFiManager wm;
-  bool hasSaved = WiFi.SSID().length() > 0;
+  // WiFi.SSID() is only the joined network, so it is empty before autoConnect.
+  // getWiFiIsSaved() reads the stored STA config, which needs the driver started.
+  WiFi.mode(WIFI_STA);
+  bool hasSaved = wm.getWiFiIsSaved();
   bool hasSecret = strlen(SECRET_WIFI_SSID) > 0;
 
   wm.setConfigPortalTimeout((hasSaved || hasSecret) ? 15 : 0);
@@ -1620,9 +1802,11 @@ void setupOta(bool wifiOk) {
   }
 
   ArduinoOTA.setHostname(cfg::kOtaHostname);
-  if (strlen(SECRET_OTA_PASSWORD) > 0) {
-    ArduinoOTA.setPassword(SECRET_OTA_PASSWORD);
+  if (!deviceSettings.otaPassword[0]) {
+    DBG_INFO("OTA disabled: set a device password in the WebUI first");
+    return;
   }
+  ArduinoOTA.setPassword(deviceSettings.otaPassword);
 
   ArduinoOTA.onStart([]() {
     otaInProgress = true;
@@ -1663,8 +1847,9 @@ void setupOta(bool wifiOk) {
   });
 
   ArduinoOTA.begin();
+  otaStarted = true;
   DBG_INFO("OTA ready | host=%s.local | auth=%s",
-           cfg::kOtaHostname, strlen(SECRET_OTA_PASSWORD) > 0 ? "enabled" : "disabled");
+           cfg::kOtaHostname, strlen(deviceSettings.otaPassword) > 0 ? "enabled" : "disabled");
 }
 
 void drawProgressTimer() {
@@ -1689,7 +1874,7 @@ void drawProgressTimer() {
 }
 
 void drawBottomDashboard() {
-  struct tm timeinfo;
+  struct tm timeinfo = {};
   bool timeOk = getLocalTime(&timeinfo, 0);
 
   int midW = 180;
@@ -1715,7 +1900,8 @@ void drawBottomDashboard() {
   lcd.setTextSize(2);
   lcd.setTextDatum(middle_center);
   char tempStr[15];
-  sprintf(tempStr, "Temp: %d C", (int)currentTemp);
+  if (weatherHasData) snprintf(tempStr, sizeof(tempStr), "Temp: %d C", (int)currentTemp);
+  else strlcpy(tempStr, "Temp: --", sizeof(tempStr));
   lcd.drawString(tempStr, midX + (midW / 2), midY + 74);
 
   int sideH = 65;
@@ -1734,11 +1920,12 @@ void drawBottomDashboard() {
     lcd.setTextColor(TFT_LIGHTGREY);
     lcd.setTextDatum(top_center);
     lcd.drawString(lblL[i], cx, 480 - 57);
-    drawWeatherIcon(partW * i + 25, 480 - 28, codL[i]);
+    if (weatherHasData) drawWeatherIcon(partW * i + 25, 480 - 28, codL[i]);
     lcd.setTextColor(TFT_WHITE);
     lcd.setTextSize(3);
     lcd.setTextDatum(middle_left);
-    lcd.drawNumber((int)tmpL[i], partW * i + 59, 480 - 28);
+    if (weatherHasData) lcd.drawNumber((int)tmpL[i], partW * i + 59, 480 - 28);
+    else lcd.drawString("--", partW * i + 59, 480 - 28);
   }
 
   int rx = midX + midW;
@@ -1755,142 +1942,92 @@ void drawBottomDashboard() {
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_LIGHTGREY);
     lcd.setTextDatum(top_center);
-    lcd.drawString(days[dayIdx], cx, 480 - 57);
-    drawWeatherIcon(curX + 25, 480 - 28, dCode[i]);
+    lcd.drawString(timeOk ? days[dayIdx] : "--", cx, 480 - 57);
+    if (weatherHasData) drawWeatherIcon(curX + 25, 480 - 28, dCode[i]);
     lcd.setTextColor(TFT_WHITE);
     lcd.setTextSize(2);
     lcd.setTextDatum(top_left);
-    lcd.drawNumber((int)dMax[i], curX + 59, 480 - 42);
+    if (weatherHasData) lcd.drawNumber((int)dMax[i], curX + 59, 480 - 42);
+    else lcd.drawString("--", curX + 59, 480 - 42);
     lcd.setTextColor(0x7BEF);
-    lcd.drawNumber((int)dMin[i], curX + 59, 480 - 22);
+    if (weatherHasData) lcd.drawNumber((int)dMin[i], curX + 59, 480 - 22);
+    else lcd.drawString("--", curX + 59, 480 - 22);
   }
   markScreenUpdated();
 }
 
 void getWeatherData() {
-  unsigned long t0 = millis();
+  const unsigned long t0 = millis();
+  WeatherUpdate update = {};
+  WiFiClientSecure client;
+  client.setInsecure(); // retain current provider compatibility; certificate work is separate
+  client.setTimeout(20000);
+  client.setHandshakeTimeout(15);
   HTTPClient http;
   http.setTimeout(20000);
-
+  http.setConnectTimeout(15000);
   String weatherUrl =
-    String("https://api.open-meteo.com/v1/forecast?"
-           "latitude=") + String(cfg::kLocationLatitude, 6) +
-    "&longitude=" + String(cfg::kLocationLongitude, 6) +
+    String("https://api.open-meteo.com/v1/forecast?latitude=") + String(deviceSettings.latitude, 6) +
+    "&longitude=" + String(deviceSettings.longitude, 6) +
     "&current=temperature_2m,weather_code"
     "&hourly=temperature_2m,weather_code,pressure_msl,cloud_cover"
     "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
     "relative_humidity_2m_mean,wind_speed_10m_max,uv_index_max,shortwave_radiation_sum"
     "&timezone=auto&forecast_days=16";
-
-  http.begin(weatherUrl);
-
-  int weatherCode = http.GET();
-  if (weatherCode == HTTP_CODE_OK) {
-    String payload = http.getString();
+  setRenderDiagPhase("forecast_fetch");
+  int code = http.begin(client, weatherUrl) ? http.GET() : -1;
+  if (code == HTTP_CODE_OK) {
     SpiRamJsonDocument doc(96 * 1024);
-    DeserializationError err = deserializeJson(doc, payload);
-
-    if (err) {
-      DBG_ERROR("Forecast JSON parse failed: %s | payload=%u | PSRAM=%u",
-                err.c_str(), (unsigned)payload.length(), ESP.getFreePsram());
+    DeserializationError err = deserializeJson(doc, http.getString());
+    update.forecastOk = !err && readForecast(doc.as<JsonVariantConst>(), update.forecast);
+    if (!update.forecastOk) {
+      DBG_WARN("Forecast rejected: %s — retaining last good data", err ? err.c_str() : "missing/non-numeric values");
     } else {
-      JsonArray hourlyTemp = doc["hourly"]["temperature_2m"].as<JsonArray>();
-      JsonArray hourlyCode = doc["hourly"]["weather_code"].as<JsonArray>();
-      JsonArray hourlyPress = doc["hourly"]["pressure_msl"].as<JsonArray>();
-      JsonArray hourlyCloud = doc["hourly"]["cloud_cover"].as<JsonArray>();
-      JsonArray dailyMax = doc["daily"]["temperature_2m_max"].as<JsonArray>();
-      JsonArray dailyMin = doc["daily"]["temperature_2m_min"].as<JsonArray>();
-      JsonArray dailyCode = doc["daily"]["weather_code"].as<JsonArray>();
-      JsonArray dailyRain = doc["daily"]["precipitation_sum"].as<JsonArray>();
-      JsonArray dailyHum = doc["daily"]["relative_humidity_2m_mean"].as<JsonArray>();
-      JsonArray dailyWind = doc["daily"]["wind_speed_10m_max"].as<JsonArray>();
-      JsonArray dailyUV = doc["daily"]["uv_index_max"].as<JsonArray>();
-      JsonArray dailySolar = doc["daily"]["shortwave_radiation_sum"].as<JsonArray>();
-
-      bool hasForecast =
-        !doc["current"]["temperature_2m"].isNull() &&
-        hourlyTemp.size() >= 22 &&
-        hourlyCode.size() >= 22 &&
-        hourlyPress.size() >= 373 &&
-        hourlyCloud.size() >= 373 &&
-        dailyMax.size() >= 16 &&
-        dailyMin.size() >= 16 &&
-        dailyCode.size() >= 16 &&
-        dailyRain.size() >= 16 &&
-        dailyHum.size() >= 16 &&
-        dailyWind.size() >= 16 &&
-        dailyUV.size() >= 16 &&
-        dailySolar.size() >= 16;
-
-      if (!hasForecast) {
-        DBG_WARN("Forecast JSON missing fields | hourlyTemp=%u hourlyPress=%u dailyMax=%u",
-                 (unsigned)hourlyTemp.size(), (unsigned)hourlyPress.size(), (unsigned)dailyMax.size());
-      } else {
-        currentTemp = doc["current"]["temperature_2m"];
-        morningTemp = hourlyTemp[9];
-        morningCode = hourlyCode[9];
-        noonTemp = hourlyTemp[14];
-        noonCode = hourlyCode[14];
-        eveningTemp = hourlyTemp[21];
-        eveningCode = hourlyCode[21];
-
-        for (int i = 0; i < 16; i++) {
-          dMax[i]   = dailyMax[i];
-          dMin[i]   = dailyMin[i];
-          dCode[i]  = dailyCode[i];
-          dRain[i]  = dailyRain[i];
-          dPress[i] = hourlyPress[i * 24 + 12];
-          dCloud[i] = hourlyCloud[i * 24 + 12];
-
-          dHum[i]   = dailyHum[i];
-          dWind[i]  = dailyWind[i];
-          dUV[i]    = dailyUV[i];
-          dSolar[i] = dailySolar[i];
-        }
-
-        DBG_INFO("Weather OK: %s | %.1f C | 16d forecast | %lums",
-                 cfg::kLocationName, currentTemp, millis() - t0);
-      }
+      DBG_INFO("Weather OK: %s | %.1f C | 16d forecast | %lums",
+               deviceSettings.locationName, update.forecast.currentTemp, millis() - t0);
     }
   } else {
-    DBG_WARN("Forecast HTTP failed: %d | %s", weatherCode, weatherUrl.c_str());
+    DBG_WARN("Forecast HTTP failed: %d — retaining last good data", code);
   }
   http.end();
-
-http.begin("https://api.rainviewer.com/public/weather-maps.json");
-if (http.GET() == 200) {
-  DynamicJsonDocument rDoc(8192);
-  deserializeJson(rDoc, http.getString());
-
-  radarHost = rDoc["host"] | "https://tilecache.rainviewer.com";
-  radarPath = "";
-
-  JsonArray past = rDoc["radar"]["past"].as<JsonArray>();
-
-  if (!past.isNull() && past.size() > 0) {
-    radarTS = past[past.size() - 1]["time"] | 0;
-    radarPath = (const char*)past[past.size() - 1]["path"];
-    DBG_VERBOSE("RainViewer frame time=%ld", radarTS);
-    DBG_VERBOSE("RainViewer path=%s", radarPath.c_str());
+  setRenderDiagPhase("radar_metadata");
+  code = http.begin(client, "https://api.rainviewer.com/public/weather-maps.json") ? http.GET() : -1;
+  if (code == HTTP_CODE_OK) {
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, http.getString());
+    JsonArrayConst past = doc["radar"]["past"].as<JsonArrayConst>();
+    JsonObjectConst latest = past.size() ? past[past.size() - 1].as<JsonObjectConst>() : JsonObjectConst();
+    const char* host = doc["host"] | "";
+    const char* path = latest["path"] | "";
+    const long timestamp = latest["time"] | 0L;
+    update.radarOk = !err && strncmp(host, "https://", 8) == 0 &&
+                     strlen(host) < 160 && path[0] == '/' && strlen(path) < 160 && timestamp > 0;
+    if (update.radarOk) {
+      radarHost = host;
+      radarPath = path;
+      radarTS = timestamp;
+    } else {
+      DBG_WARN("RainViewer metadata rejected — retaining last good radar frame");
+    }
   } else {
-    DBG_WARN("RainViewer: no past radar frames available");
+    DBG_WARN("RainViewer HTTP failed: %d — retaining last good radar frame", code);
   }
-} else {
-  DBG_WARN("RainViewer API request failed");
-}
-http.end();
+  http.end();
+  update.completedMs = millis();
+  if (weatherUpdateQueue) xQueueOverwrite(weatherUpdateQueue, &update);
+  else applyWeatherUpdate(update); // startup runs on the main task, before the worker exists
 }
 
 int getDayOfMonthOffset(struct tm baseTime, int offsetDays) {
-  time_t raw = mktime(&baseTime);
-  raw += (offsetDays * 86400);
-  struct tm *t2 = localtime(&raw);
-  return t2->tm_mday;
+  baseTime.tm_mday += offsetDays;
+  baseTime.tm_isdst = -1;
+  mktime(&baseTime);
+  return baseTime.tm_mday;
 }
 
 void drawGraphPage(int type) {
-  struct tm ti;
-  getLocalTime(&ti);
+  struct tm ti = {};
+  const bool timeOk = getLocalTime(&ti, 0);
 
   lcd.fillScreen(TFT_BLACK);
   lcd.drawRect(0, 0, 800, 480, TFT_WHITE);
@@ -1901,6 +2038,11 @@ void drawGraphPage(int type) {
   lcd.setTextSize(2);
   lcd.setTextDatum(middle_center);
   lcd.drawString("BACK", 65, 442);
+  if (!timeOk || !weatherHasData) {
+    lcd.drawString(!weatherHasData ? "Weather data unavailable" : "Waiting for time sync", 400, 220);
+    markScreenUpdated();
+    return;
+  }
 
   // Units label
 const char* unitTxt = "";
@@ -1946,6 +2088,7 @@ lcd.drawString(unitTxt, 370, 448 );
     }
     minV = floor(minV / 5) * 5;
     maxV = ceil(maxV / 5) * 5;
+    if (maxV <= minV) maxV = minV + 5;
   }
   else if (type == 2) {
     minV = 2000;
@@ -2009,7 +2152,7 @@ lcd.drawString(unitTxt, 370, 448 );
       float v1 = dCloud[i], v2 = dCloud[i + 1];
       for (int px = 0; px < dW; px++) {
         float interVal = v1 + (v2 - v1) * (float)px / dW;
-        int interY = map(interVal, minV, maxV, sY, eY);
+        int interY = graphCoordinate(interVal, minV, maxV, sY, eY);
         lcd.drawFastVLine(x1 + px, interY, sY - interY, lcd.color565(35, 35, 35));
       }
     }
@@ -2040,7 +2183,7 @@ lcd.drawString(unitTxt, 370, 448 );
   if (step < 1) step = 1;
 
   for (float v = minV; v <= maxV; v += step) {
-    int yP = map(v, minV, maxV, sY, eY);
+    int yP = graphCoordinate(v, minV, maxV, sY, eY);
     lcd.drawFastHLine(sX, yP, eX - sX, lcd.color565(60, 60, 60));
     lcd.drawNumber((int)v, sX - 12, yP);
   }
@@ -2073,7 +2216,7 @@ lcd.drawString(unitTxt, 370, 448 );
       float barVal = (type == 3) ? dRain[i] : dSolar[i];
       uint16_t barCol = (type == 3) ? TFT_BLUE : TFT_YELLOW;
 
-      int barH = map(barVal, 0, maxV, 0, sY - eY);
+      int barH = graphCoordinate(barVal, 0, maxV, 0, sY - eY);
       lcd.fillRect(x1 - 15, sY - barH, 30, barH, barCol);
       lcd.drawRect(x1 - 15, sY - barH, 30, barH, TFT_WHITE);
 
@@ -2108,7 +2251,7 @@ lcd.drawString(unitTxt, 370, 448 );
         col = TFT_MAGENTA;
       }
 
-      int y1 = map(val1, minV, maxV, sY, eY);
+      int y1 = graphCoordinate(val1, minV, maxV, sY, eY);
 
       if (i < 15) {
         float val2 = 0;
@@ -2121,12 +2264,12 @@ lcd.drawString(unitTxt, 370, 448 );
         else if (type == 7) val2 = dUV[i + 1];
 
         int x2 = sX + ((i + 1) * dW) + (dW / 2);
-        int y2 = map(val2, minV, maxV, sY, eY);
+        int y2 = graphCoordinate(val2, minV, maxV, sY, eY);
         lcd.drawLine(x1, y1, x2, y2, col);
 
         if (type == 1) {
-          int yMin1 = map(dMin[i], minV, maxV, sY, eY);
-          int yMin2 = map(dMin[i + 1], minV, maxV, sY, eY);
+          int yMin1 = graphCoordinate(dMin[i], minV, maxV, sY, eY);
+          int yMin2 = graphCoordinate(dMin[i + 1], minV, maxV, sY, eY);
           lcd.drawLine(x1, yMin1, x2, yMin2, TFT_BLUE);
         }
       }
@@ -2135,7 +2278,7 @@ lcd.drawString(unitTxt, 370, 448 );
       lcd.drawCircle(x1, y1, 4, TFT_WHITE);
 
       if (type == 1) {
-        int yMin = map(dMin[i], minV, maxV, sY, eY);
+        int yMin = graphCoordinate(dMin[i], minV, maxV, sY, eY);
         lcd.fillCircle(x1, yMin, 4, TFT_BLUE);
         lcd.drawCircle(x1, yMin, 4, TFT_WHITE);
       }
@@ -2165,6 +2308,7 @@ void drawLocationMarker() {
 void renderRadarMap() {
   unsigned long renderStart = millis();
   int tilesOk = 0, tilesErr = 0;
+  bool complete = true;
   int targetLayer = renderLayerStyle;
   int targetMapStyle = renderMapStyle;
   int targetZoom = renderZoom;
@@ -2217,6 +2361,8 @@ void renderRadarMap() {
       if (ESP.getFreeHeap() < 80000) {
         DBG_WARN("Tile %d/%d skipped — heap low: %u bytes",
                  renderTilesDone + 1, renderTilesTotal, ESP.getFreeHeap());
+        complete = false;
+        tilesErr++;
         renderTilesDone += 1;
         renderDiagLastProgressMs = millis();
         continue;
@@ -2243,9 +2389,10 @@ void renderRadarMap() {
         unsigned long decodeStart = millis();
 #endif
         if (png.openRAM(baseBuf, baseLen, pngDrawCanvas) == PNG_SUCCESS) {
-          png.decode(NULL, 0);
+          const bool decoded = validTileDimensions(png.getWidth(), png.getHeight()) && png.decode(NULL, 0) == PNG_SUCCESS;
           png.close();
-          tilesOk++;
+          if (decoded) tilesOk++;
+          else { tilesErr++; complete = false; DBG_WARN("Base tile dimensions/decode rejected"); }
 #if DEBUG_LEVEL >= 4
           DBG_VERBOSE("Tile %d/%d base decoded | bytes=%u | %lums",
                       tileIndex, renderTilesTotal, (unsigned)baseLen, millis() - decodeStart);
@@ -2253,17 +2400,20 @@ void renderRadarMap() {
         } else {
           DBG_WARN("Base PNG open failed: %s", mU.c_str());
           tilesErr++;
+          complete = false;
         }
         free(baseBuf);
       } else {
         DBG_WARN("Base fetch failed: %s", mU.c_str());
         tilesErr++;
+        complete = false;
       }
 
       String layerUrl = "";
 
 if (targetLayer == 0) {
-	  if (radarPath.length() > 0) {
+      if (targetZoom <= cfg::kRadarMaxZoom && radarPath.length() == 0) complete = false;
+	  if (targetZoom <= cfg::kRadarMaxZoom && radarPath.length() > 0) {
 	    layerUrl = radarHost + radarPath + "/256/" +
 	               String(targetZoom) + "/" +
 	               String(wrappedTileX) + "/" +
@@ -2304,6 +2454,7 @@ if (targetLayer == 0) {
       overlayBuf[7] == 0x0A;
 
     if (!isPng) {
+      complete = false;
       DBG_WARN("Overlay is NOT PNG! len=%u", (unsigned)overlayLen);
 #if DEBUG_LEVEL >= 4
       Serial.print("[VERB]  First 32 bytes HEX: ");
@@ -2327,9 +2478,10 @@ if (targetLayer == 0) {
 #endif
       int rc = png.openRAM(overlayBuf, overlayLen, pngDrawOverlayCanvas);
       if (rc == PNG_SUCCESS) {
-        int decRc = png.decode(NULL, 0);
+        int decRc = validTileDimensions(png.getWidth(), png.getHeight()) ? png.decode(NULL, 0) : -1;
         if (decRc != PNG_SUCCESS) {
-          DBG_WARN("PNG decode failed rc=%d", decRc);
+          complete = false;
+          DBG_WARN("PNG dimensions/decode failed rc=%d", decRc);
         }
         png.close();
 #if DEBUG_LEVEL >= 4
@@ -2337,12 +2489,14 @@ if (targetLayer == 0) {
                     tileIndex, renderTilesTotal, (unsigned)overlayLen, millis() - decodeStart);
 #endif
       } else {
+        complete = false;
         DBG_WARN("Overlay PNG open failed rc=%d", rc);
       }
       free(overlayBuf);
     }
 
   } else {
+    complete = false;
     if (overlayStatus == HTTP_CODE_UNAUTHORIZED && targetLayer != 0) {
       owmAuthFailed = true;
       DBG_ERROR("OpenWeatherMap overlay unauthorized (401) — check SECRET_OWM_API_KEY");
@@ -2374,6 +2528,7 @@ if (targetLayer == 0) {
            layerNames[targetLayer], targetZoom, mapNames[targetMapStyle], tilesOk, tilesErr,
            millis() - renderStart);
 #endif
+  renderSucceeded = complete;
   clearRenderDiag();
 }
 
@@ -2477,7 +2632,17 @@ void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
 
   if (targetLayer < 0 || targetLayer > 2) targetLayer = 0;
 
-  if (!forceRefresh && layerCacheFresh(targetLayer)) {
+  // READY still owns scratch until the main task publishes it. Queue requests
+  // rather than letting the worker overwrite that completed frame.
+  if (renderState == RENDER_READY) {
+    renderPending = true;
+    pendingLayerStyle = targetLayer;
+    pendingRenderForce = forceRefresh;
+    return;
+  }
+  const bool coolingDown = layerCacheMatches(targetLayer) && layerCaches[targetLayer].degraded &&
+    millis() - layerCaches[targetLayer].lastAttemptMs < (unsigned long)cfg::kWeatherRetrySecs * 1000UL;
+  if (!forceRefresh && (layerCacheFresh(targetLayer) || coolingDown)) {
     mapFront = layerCacheSprites[targetLayer];
     DBG_INFO("Layer cache hit | layer=%s age=%lus | zoom=%d map=%s",
              layerNames[targetLayer], layerCacheAgeSecs(targetLayer), myZoom, mapNames[mapStyle]);
@@ -2496,6 +2661,7 @@ void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
       return;
     }
 
+    renderCompletionPending = false;
     renderState = RENDER_READY;
     return;
   }
@@ -2512,6 +2678,7 @@ void triggerRenderForLayer(int targetLayer, bool forceRefresh) {
   renderLayerStyle = targetLayer;
   renderMapStyle = mapStyle;
   renderZoom = myZoom;
+  renderAlphaPercent = constrain(overlayAlphaPercent[targetLayer], 0, 100);
   renderState = RENDER_BUSY;
 #if DEBUG_LEVEL >= 4
   DBG_VERBOSE("Render scheduled | layer=%s force=%d cacheValid=%d cacheAge=%lus refresh=%ds",
@@ -2540,7 +2707,7 @@ void drawStartupScreen(bool wifiOk, const char* ssid, const char* ip) {
 
   lcd.setTextColor(TFT_YELLOW);
   lcd.setTextSize(2);
-  lcd.drawString(cfg::kLocationName, 400, 105);
+  lcd.drawString(deviceSettings.locationName, 400, 105);
 
   if (wifiOk) {
     lcd.setTextColor(TFT_GREEN);
@@ -2553,7 +2720,7 @@ void drawStartupScreen(bool wifiOk, const char* ssid, const char* ip) {
   }
 
   lcd.setTextColor(TFT_LIGHTGREY);
-  lcd.drawString(cfg::kNtpTimezone, 400, 190);
+  lcd.drawString(deviceSettings.timezone, 400, 190);
 
   char mBuf[64];
   snprintf(mBuf, sizeof(mBuf), "PSRAM: %uKB free   Heap: %uKB free",
@@ -2676,10 +2843,10 @@ void updateRenderStatusOverlay(bool force) {
 void logStartupBanner(bool wifiOk, const char* ip) {
   DBG_INFO("=== ESP32S3-Weather v%s ===========================", kFwVersion);
   DBG_INFO("Location  : %s (%.4f, %.4f)",
-           cfg::kLocationName, cfg::kLocationLatitude, cfg::kLocationLongitude);
+           deviceSettings.locationName, deviceSettings.latitude, deviceSettings.longitude);
   if (wifiOk) {
     DBG_INFO("WiFi      : connected | SSID: %s | IP: %s", WiFi.SSID().c_str(), ip);
-    DBG_INFO("NTP       : configured | TZ: %s", cfg::kNtpTimezone);
+    DBG_INFO("NTP       : configured | TZ: %s", deviceSettings.timezone);
   } else {
     DBG_INFO("WiFi      : NOT connected");
   }
@@ -2727,34 +2894,23 @@ void pollRenderWatchdog() {
 
 // ---------------------------------------------------------------------------
 // renderTaskFn — Core 1 task. Waits for notification, renders into the scratch
-// sprite, copies it into the target layer cache, then signals READY. It never
+// sprite, then signals READY for main-task cache publication. It never
 // touches the display bus directly.
 // ---------------------------------------------------------------------------
 void renderTaskFn(void*) {
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    if (weatherRefreshPending) {
-      weatherRefreshPending = false;
+    if (weatherRefreshPending.exchange(false)) {
       getWeatherData();
     }
     int completedLayer = renderLayerStyle;
     DBG_VERBOSE("RenderTask wake | core=%d | stackHW=%u | heap=%u largest=%u",
                 xPortGetCoreID(), renderStackHighWater(), ESP.getFreeHeap(), largestInternalBlock());
     renderRadarMap();
-    setRenderDiagPhase("cache_copy");
-    // Discard result if zoom or map style changed while the render was in-flight.
-    // Core 0 will re-trigger via renderPending at the current settings.
-    if (renderZoom != myZoom || renderMapStyle != mapStyle) {
-      DBG_INFO("Render discarded (stale) | layer=%s zoom=%d→%d map=%s→%s",
-               layerNames[completedLayer], renderZoom, myZoom,
-               mapNames[renderMapStyle], mapNames[mapStyle]);
-    } else {
-      renderScratch.pushSprite(layerCacheSprites[completedLayer], 0, 0);
-      markLayerCacheUpdated(completedLayer);
-      if (completedLayer == layerStyle) {
-        mapFront = layerCacheSprites[completedLayer];
-      }
-    }
+    setRenderDiagPhase("await_publish");
+    // Scratch is published only by the main task after this release. The worker
+    // sleeps until notified again and never mutates a displayed layer cache.
+    renderCompletionPending = true;
     renderState = RENDER_READY;
 #if DEBUG_LEVEL >= 4
     DBG_VERBOSE("RenderTask ready | layer=%s cacheAge=%lus | stackHW=%u | heap=%u largest=%u",
@@ -2888,7 +3044,7 @@ void saveSleepSettings() {
 
 bool isInSleepWindow() {
   struct tm ti;
-  if (!getLocalTime(&ti)) return false;
+  if (!getLocalTime(&ti, 0)) return false;
   int nowMins = ti.tm_hour * 60 + ti.tm_min;
   int onMins  = sleepOnHour  * 60 + sleepOnMinute;
   int offMins = sleepOffHour * 60 + sleepOffMinute;
@@ -2991,6 +3147,7 @@ void pollSleepSchedule() {
 
 void setup() {
   Serial.begin(115200);
+  beginInstallerProvisioning();
   delay(1000);
 
   initBoardHardware(0);
@@ -3011,6 +3168,9 @@ void setup() {
   lcd.drawString("Connecting...", 400, 240);
   markScreenUpdated();
 
+  loadDeviceSettings();
+  myLat = deviceSettings.latitude;
+  myLon = deviceSettings.longitude;
   loadOverlaySettings();
   loadSleepSettings();
 
@@ -3018,7 +3178,7 @@ void setup() {
   String ip = "";
   if (wifiOk) {
     ip = WiFi.localIP().toString();
-    configTzTime(cfg::kNtpTimezone, ntpServer);
+    configTzTime(deviceSettings.timezone, ntpServer);
 
     // Wait up to 10 s for first NTP sync — SNTP is async so without this the
     // clock shows epoch time until it syncs sometime after setup() finishes.
@@ -3038,7 +3198,7 @@ void setup() {
   // this handler only fires for subsequent reconnections.
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     DBG_INFO("WiFi reconnected — resyncing NTP");
-    configTzTime(cfg::kNtpTimezone, ntpServer);
+    configTzTime(deviceSettings.timezone, ntpServer);
   }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
 
   setupOta(wifiOk);
@@ -3048,16 +3208,23 @@ void setup() {
   cacheRadar.setPsram(true);
   cacheClouds.setPsram(true);
   cacheRain.setPsram(true);
-  if (!renderScratch.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("renderScratch alloc failed");
-  if (!cacheRadar.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("cacheRadar alloc failed");
-  if (!cacheClouds.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("cacheClouds alloc failed");
-  if (!cacheRain.createSprite(cfg::kScreenWidth, kMapCanvasHeight)) DBG_ERROR("cacheRain alloc failed");
+  const bool scratchOk = renderScratch.createSprite(cfg::kScreenWidth, kMapCanvasHeight) != nullptr;
+  const bool radarOk = cacheRadar.createSprite(cfg::kScreenWidth, kMapCanvasHeight) != nullptr;
+  const bool cloudsOk = cacheClouds.createSprite(cfg::kScreenWidth, kMapCanvasHeight) != nullptr;
+  const bool rainOk = cacheRain.createSprite(cfg::kScreenWidth, kMapCanvasHeight) != nullptr;
+  if (!scratchOk || !radarOk || !cloudsOk || !rainOk) {
+    DBG_ERROR("Map sprite allocation failed — rendering disabled");
+    lcd.fillScreen(TFT_BLACK);
+    lcd.drawString("Map memory unavailable", 400, 240);
+    markScreenUpdated();
+    return;
+  }
   DBG_INFO("Layer cache sprites allocated | PSRAM free=%u largest=%u",
            ESP.getFreePsram(), largestPsramBlock());
 
   drawStartupScreen(wifiOk, WiFi.SSID().c_str(), ip.c_str());
 
-  lastUpdate = millis();
+  realtimeRefreshLastMs = millis();
   getWeatherData();
 
   // Update startup screen status now that weather is done and map tiles are next.
@@ -3069,6 +3236,11 @@ void setup() {
   lcd.drawString("Fetching map tiles...", 400, 390);
   markScreenUpdated();
 
+  weatherUpdateQueue = xQueueCreate(1, sizeof(WeatherUpdate));
+  if (!weatherUpdateQueue) {
+    DBG_ERROR("Weather update queue allocation failed — rendering disabled");
+    return;
+  }
   BaseType_t renderTaskOk = xTaskCreatePinnedToCore(
     renderTaskFn,
     "RenderTask",
@@ -3089,8 +3261,6 @@ void setup() {
   }
 
   layerCycleLastMs = millis();
-  realtimeRefreshLastMs = millis();
-  lastUpdate = realtimeRefreshLastMs;
   triggerRenderForLayer(layerStyle, false);
 
 #ifdef CFG_BACKLIGHT_PWM_ENABLED
@@ -3110,9 +3280,11 @@ void loop() {
   static unsigned long lastSleepCheckMs = 0;
   struct tm ti;
 
+  if (deviceRebootAt && static_cast<int32_t>(millis() - deviceRebootAt) >= 0) ESP.restart();
+  consumeWeatherUpdate();
   handleWebUiClient();
 
-  if (WiFi.isConnected()) {
+  if (otaStarted && WiFi.isConnected()) {
     ArduinoOTA.handle();
   }
   if (otaInProgress) {
@@ -3122,9 +3294,27 @@ void loop() {
 
   // --- Flip completed background render to screen ---
   if (renderState == RENDER_READY) {
-    renderState    = RENDER_IDLE;
+    const int completedLayer = renderLayerStyle;
+    const bool currentRequest = renderZoom == myZoom && renderMapStyle == mapStyle &&
+      renderAlphaPercent == constrain(overlayAlphaPercent[completedLayer], 0, 100);
+    if (renderCompletionPending && currentRequest) {
+      if (renderSucceeded || !layerCacheMatches(completedLayer)) {
+        renderScratch.pushSprite(layerCacheSprites[completedLayer], 0, 0);
+        markLayerCacheUpdated(completedLayer, renderSucceeded);
+      } else {
+        // Preserve the last complete frame and its successful timestamp.
+        layerCaches[completedLayer].degraded = true;
+        layerCaches[completedLayer].lastAttemptMs = millis();
+        DBG_WARN("Render incomplete — retaining last good %s cache", layerNames[completedLayer]);
+      }
+      if (completedLayer == layerStyle) mapFront = layerCacheSprites[completedLayer];
+    } else if (renderCompletionPending) {
+      DBG_INFO("Render discarded — view or opacity changed during download");
+    }
+    renderCompletionPending = false;
+    renderState = RENDER_IDLE;
     firstRenderDone = true;
-    if (sleepPhase == SLEEP_AWAKE || sleepPhase == SLEEP_TOUCH_WOKEN) {
+    if (appState == 0 && (sleepPhase == SLEEP_AWAKE || sleepPhase == SLEEP_TOUCH_WOKEN)) {
       lcd.fillScreen(TFT_BLACK);
       mapFront->pushSprite(0, 0);
       drawMapBadges();
@@ -3168,9 +3358,12 @@ void loop() {
       DBG_INFO("Sleep: woken by touch | re-sleep in %ds", sleepWakeDurationSecs);
       delay(200);
     }
+    delay(1);
     return;
   }
 
+  if (weatherDataChanged && appState != 0) drawGraphPage(appState);
+  weatherDataChanged = false;
   updateRenderStatusOverlay(false);
   pollRenderWatchdog();
 
@@ -3209,14 +3402,16 @@ void loop() {
   }
 
   // --- Realtime weather + map refresh ---
-  if (appState == 0 &&
-      millis() - realtimeRefreshLastMs > (unsigned long)cfg::kRealtimeRefreshSecs * 1000UL) {
+  const uint32_t refreshIntervalMs = (uint32_t)(weatherRetryNeeded ? cfg::kWeatherRetrySecs : cfg::kRealtimeRefreshSecs) * 1000UL;
+  if (WiFi.isConnected() && !weatherInFlight && renderTaskHandle &&
+      refreshDue(millis(), realtimeRefreshLastMs, refreshIntervalMs)) {
     realtimeRefreshLastMs = millis();
-    lastUpdate = realtimeRefreshLastMs;
-    DBG_INFO("Realtime refresh due | interval=%ds | scheduling weather+render on Core 1",
-             cfg::kRealtimeRefreshSecs);
+    weatherInFlight = true;
+    DBG_INFO("Realtime refresh due | interval=%lus | scheduling weather+render on Core 1",
+             (unsigned long)(refreshIntervalMs / 1000UL));
     weatherRefreshPending = true;
     triggerRenderForLayer(layerStyle, true);
-    drawMapBadges();
+    if (appState == 0) drawMapBadges();
   }
+  delay(1);
 }

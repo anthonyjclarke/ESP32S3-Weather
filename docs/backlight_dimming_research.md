@@ -2,7 +2,12 @@
 
 **Date:** 2026-05-03  
 **Firmware version at research:** 1.4.0  
-**Status:** Not yet implemented — options documented for execution
+**Status:** Historical research; software PWM is now implemented.
+
+As of 1.5.7, `CFG_BACKLIGHT_PWM_ENABLED` enables the 100 Hz Core 0 task in
+`src/display_hw.cpp`; night brightness is adjustable through the WebUI and NVS.
+The old constraints and alternatives below describe the pre-implementation
+investigation. Touch reset now shares the Wire mutex with PWM transactions.
 
 ---
 

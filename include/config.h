@@ -2,7 +2,14 @@
 
 #include <Arduino.h>
 
-constexpr const char* kFwVersion = "1.5.2";
+// Identity shared by startup, WebUI, Improv and installer metadata. Keep the
+// project name stable so ESP Web Tools recognizes a settings-preserving Update.
+#define FIRMWARE_VERSION "1.5.10"
+#define IMPROV_SETUP_ENABLED 1
+constexpr const char* PROJECT_NAME = "ESP32S3-Weather";
+constexpr const char* PROJECT_REPO_URL = "https://github.com/anthonyjclarke/ESP32S3-Weather";
+constexpr const char* AP_NAME = "ESP32S3-Weather";
+constexpr const char* kFwVersion = FIRMWARE_VERSION;
 
 namespace cfg {
 
@@ -13,17 +20,24 @@ constexpr int kScreenHeight = 480;
 // 1. Set kLocationName to the label you want to use for this dashboard.
 // 2. Set latitude/longitude in decimal degrees. South is negative, east is positive.
 // 3. kMapZoom controls the startup zoom. kMapZoomMin/kMapZoomMax set the touch-cycle
-//    range. Radar and OWM overlay tiles are only available up to zoom 12; above that
-//    the base map still works but overlays will not load.
+//    range. RainViewer radar is available up to zoom 7; higher zooms show the
+//    base map without radar. OWM overlays retain the configured zoom range.
 // 4. kDefaultMapStyle selects startup map base: 0 = dark, 1 = topo, 2 = OSM.
 // 5. The base-map contrast/brightness values tune tile visibility on the LCD.
 
+#ifdef WEATHER_PUBLIC_BUILD
+constexpr const char* kLocationName = "Sydney, Australia";
+constexpr double kLocationLatitude = -33.8688;
+constexpr double kLocationLongitude = 151.2093;
+#else
 constexpr const char* kLocationName = "Putney, NSW, Australia";
 constexpr double kLocationLatitude  = -33.8261;
 constexpr double kLocationLongitude = 151.1063;
+#endif
 constexpr int kMapZoom    = 7;
 constexpr int kMapZoomMin = 5;   // minimum touch-cycle zoom
-constexpr int kMapZoomMax = 12;  // maximum touch-cycle zoom (overlay tiles top out here)
+constexpr int kMapZoomMax = 12;  // maximum touch-cycle zoom
+constexpr int kRadarMaxZoom = 7; // RainViewer public API limit; higher zooms show base map only
 constexpr int kDefaultMapStyle = 1;          // 0 = dark, 1 = topo, 2 = OSM
 constexpr int kBaseMapContrastPercent = 125; // 100 = unchanged
 constexpr int kBaseMapBrightness = 18;       // -255 to 255, applied after contrast
@@ -35,7 +49,8 @@ constexpr const char* kWifiApName  = "ESP32S3-Weather";
 constexpr const char* kOtaHostname = "ESP32S3-Weather";
 constexpr const char* kNtpTimezone = "AEST-10AEDT,M10.1.0,M4.1.0/3";
 constexpr int         kLayerCycleSecs = 30;
-constexpr int         kRealtimeRefreshSecs = 1800; // weather/map API refresh interval
+constexpr int         kRealtimeRefreshSecs = 3600; // hourly weather/map API refresh and cache freshness
+constexpr int         kWeatherRetrySecs = 300; // retry failed weather/tiles after 5 minutes
 constexpr uint32_t    kRenderTaskStackBytes = 32768;
 constexpr UBaseType_t kRenderTaskPriority = 1;
 constexpr uint32_t    kRenderStallWarnMs = 10000;
@@ -117,6 +132,7 @@ constexpr int GT911_INT_PIN = 4;
 constexpr uint8_t CH422G_TP_RST  = 1;
 constexpr uint8_t CH422G_LCD_BL  = 2;
 constexpr uint8_t CH422G_LCD_RST = 3;
+constexpr uint8_t CH422G_USB_SEL = 5;  // low = native USB on GPIO19/20, high = CAN
 
 constexpr bool TOUCH_SWAP_XY  = false;
 constexpr bool TOUCH_INVERT_X = false;

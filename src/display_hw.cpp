@@ -7,7 +7,8 @@
 static constexpr uint8_t CH422G_ADDR_WR_SET = 0x24;
 static constexpr uint8_t CH422G_ADDR_WR_IO  = 0x38;
 
-static uint8_t ch422gWrIo = 0xFF;
+// All outputs high except USB_SEL: native USB carries Improv provisioning.
+static uint8_t ch422gWrIo = 0xFF & ~(1u << CH422G_USB_SEL);
 
 static void ch422gSetPin(uint8_t pin, uint8_t val) {
   if (val) {
@@ -137,9 +138,15 @@ void resetTouchController() {
   digitalWrite(GT911_INT_PIN, LOW);
   delay(10);
 
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  xSemaphoreTake(gWireMutex, portMAX_DELAY);
+#endif
   ch422gSetPin(CH422G_TP_RST, 0);
   delay(100);
   ch422gSetPin(CH422G_TP_RST, 1);
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  xSemaphoreGive(gWireMutex);
+#endif
   delay(200);
 
   pinMode(GT911_INT_PIN, INPUT);
