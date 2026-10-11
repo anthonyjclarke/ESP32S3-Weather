@@ -137,9 +137,15 @@ void resetTouchController() {
   digitalWrite(GT911_INT_PIN, LOW);
   delay(10);
 
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  xSemaphoreTake(gWireMutex, portMAX_DELAY);
+#endif
   ch422gSetPin(CH422G_TP_RST, 0);
   delay(100);
   ch422gSetPin(CH422G_TP_RST, 1);
+#ifdef CFG_BACKLIGHT_PWM_ENABLED
+  xSemaphoreGive(gWireMutex);
+#endif
   delay(200);
 
   pinMode(GT911_INT_PIN, INPUT);

@@ -6,6 +6,15 @@ The original reference project was published by Mirko Pavleski on Hackster.io an
 
 ---
 
+## Current fork behavior (1.5.7)
+
+Scheduled forecast and radar metadata refreshes run hourly on any page while
+awake, with five-minute retries after failed weather requests. The 30-second
+layer cycle reuses cached maps. The WebUI displays firmware version and data
+age. Brightness is controlled through night settings in the WebUI; the reference
+side brightness gesture is not implemented in this fork. Radar is limited to
+zoom 7. Historical reference behavior below is identified where it differs.
+
 ## What It Does
 
 The dashboard connects to Wi-Fi, synchronises the current time, downloads weather data for a configured latitude and longitude, and renders a graphical weather interface on the display.
@@ -20,7 +29,7 @@ The main screen shows:
 - Wi-Fi signal status.
 - A short forecast for the current day.
 - A multi-day forecast summary.
-- Touch areas for switching map styles, zoom levels, overlay layers, brightness, and forecast graph pages.
+- Touch areas for switching map styles, zoom levels, overlay layers and forecast graph pages. Night brightness is set in the WebUI.
 
 ---
 
@@ -60,7 +69,7 @@ The dashboard supports touch-based map interaction.
 | Centre map press    | Cycles through available zoom levels          |
 | Clock / map style   | Switches base map style                       |
 | Top layer selector  | Switches weather overlay layer                |
-| Side brightness bar | Adjusts screen backlight                      |
+| Side brightness bar | Reference design only; use WebUI night brightness in this fork |
 | Forecast buttons    | Opens detailed 16-day forecast graph screens  |
 | Back button         | Returns from graph view to the main dashboard |
 
@@ -132,7 +141,7 @@ The exact icon artwork may vary in this fork, but the functional purpose is the 
 
 ## Update Cycle
 
-Weather data is refreshed periodically. In the reference design, weather information updates approximately every 10 minutes. A progress indicator on the side of the display shows the time elapsed since the last update.
+This fork schedules weather refreshes hourly while awake and retries failed requests after five minutes. The original reference design used approximately ten minutes. A progress indicator on the side of the display shows the time elapsed since the last update.
 
 This helps make the dashboard feel live without constantly reloading data or making unnecessary API requests.
 

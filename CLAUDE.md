@@ -1,6 +1,6 @@
 # Project: ESP32S3-Weather
 
-Live weather dashboard with slippy-map base tiles (Carto dark / OpenTopoMap / OSM), RainViewer radar overlay, optional OpenWeatherMap cloud/rain overlays, and Open-Meteo 16-day forecast. Touch navigates 8 graph pages and cycles map zoom/layer/style. WebUI at port 80 provides live TFT mirroring and remote controls. Version 1.5.2.
+Live weather dashboard with slippy-map base tiles (Carto dark / OpenTopoMap / OSM), RainViewer radar overlay, optional OpenWeatherMap cloud/rain overlays, and Open-Meteo 16-day forecast. Touch navigates 8 graph pages and cycles map zoom/layer/style. WebUI at port 80 provides live TFT mirroring and remote controls. Version 1.5.8.
 
 **Target:** Waveshare ESP32-S3-Touch-LCD-7 (ESP32-S3, 16 MB Flash, 8 MB OPI PSRAM, ST7262 800×480 RGB panel, GT911 I2C capacitive touch).
 
@@ -12,7 +12,7 @@ CH422G expander (I2C control) logical pins: `CH422G_TP_RST` = 1 (GT911 reset), `
 
 ## Hardware Quirks & Workarounds
 
-- **Backlight is digital on/off by default.** Uncomment `#define CFG_BACKLIGHT_PWM_ENABLED` in `config.h` to enable software PWM (100 Hz FreeRTOS task on Core 0). When active, `setBacklightDim(0–255)` provides proportional control used by sleep schedule. See `docs/backlight_dimming_research.md`.
+- **Backlight uses digital on/off for normal display brightness.** `CFG_BACKLIGHT_PWM_ENABLED` is currently enabled in `config.h` for software PWM (100 Hz FreeRTOS task on Core 0). When active, `setBacklightDim(0–255)` provides proportional control used by sleep schedule. See `docs/backlight_dimming_research.md`.
 - **PSRAM required.** Four 800×415 sprites live in PSRAM (`renderScratch`, `cacheRadar`, `cacheClouds`, `cacheRain`); `BOARD_HAS_PSRAM` must be set.
 - **`--no-stub` required for upload.** pioarduino platform requires this flag; removing it causes upload failure.
 - **HTTPS without cert verification.** `fetchPngToBuffer()` and `getWeatherData()` use `WiFiClientSecure` with `.setInsecure()`. Works but skips validation — do not change without testing all tile sources.
@@ -24,7 +24,7 @@ CH422G expander (I2C control) logical pins: `CH422G_TP_RST` = 1 (GT911 reset), `
 
 | Library | Version | Purpose |
 |:--------|:--------|:--------|
-| `lovyan03/LovyanGFX` | `^1.1.16` | RGB bus display driver |
+| `LovyanGFX` | commit `d504ab7` (pinned) | RGB driver with shared LCD_CAM interrupt fix (#841/#844) |
 | `esp-arduino-libs/esp-lib-utils` | `#v0.1.2` | ESP utility helpers |
 | `tzapu/WiFiManager` | `^2.0.16-rc.2` | Captive portal provisioning |
 | `bblanchon/ArduinoJson` | `^6.21.5` | JSON parsing |
@@ -34,8 +34,14 @@ CH422G expander (I2C control) logical pins: `CH422G_TP_RST` = 1 (GT911 reset), `
 
 ## Render Architecture (Core 1 Background + Layer Cache)
 
-**Rule:** `lcd.` calls only from Core 0. Core 1 writes PSRAM sprite only.  
-**Rule:** All HTTP (tiles + weather) on Core 1. Core 0 never blocks on network I/O.
+**Rule:** `lcd.` calls belong to the Arduino main task; the render worker writes
+only `renderScratch`. Both tasks run on Core 1 in the current framework defaults.
+The PWM task runs on Core 0. Do not infer ownership from core numbers.
+Startup weather fetching runs in `setup()`; subsequent provider requests run in
+the worker. WebUI handlers and framebuffer streaming run synchronously in main.
+Weather snapshots cross a length-one FreeRTOS queue. Atomic READY publication
+transfers scratch ownership to main, which copies into retained layer caches.
+Requests arriving during READY are queued until main consumes the frame.
 
 Per-layer retained PSRAM sprite cache:
 
@@ -43,14 +49,14 @@ Per-layer retained PSRAM sprite cache:
 |:-------|:-----|
 | `renderScratch` | Core 1 renders into this |
 | `cacheRadar` / `cacheClouds` / `cacheRain` | Full-map PSRAM sprite cache per layer |
-| `renderState` | `IDLE` → `BUSY` (Core 1) → `READY` → `IDLE` (Core 0 flip) |
+| `renderState` | `IDLE` → `BUSY` (Core 1) → `READY` → `IDLE` (main-task flip) |
 | `renderPending` | Re-triggers render if set during BUSY |
-| `weatherRefreshPending` | Core 0 sets; Core 1 calls `getWeatherData()` before rendering |
+| `weatherRefreshPending` | Main task sets; Core 1 calls `getWeatherData()` before rendering |
 | `owmAuthFailed` | Set on OWM 401; CLOUDS/RAIN auto-skipped for session |
-| `screenFrameVersion` | Incremented per Core 0 frame push; WebUI polls for changes |
-| `renderTaskFn` | FreeRTOS Core 1 task (32 KB stack, priority 1): waits `xTaskNotifyGive()` → fetches weather if pending → renders scratch → copies to layer cache → sets READY |
+| `screenFrameVersion` | Incremented per main-task frame push; WebUI polls for changes |
+| `renderTaskFn` | FreeRTOS Core 1 task (32 KB stack, priority 1): waits `xTaskNotifyGive()` → fetches weather if pending → renders scratch → sets READY → main publishes cache |
 
-Layer auto-cycle `cfg::kLayerCycleSecs` (default 30 s); touch resets timer. Realtime refresh `cfg::kRealtimeRefreshSecs` (default 1800 s); tiles only fetched on cache miss, zoom/style change, or refresh interval expiry.
+Layer auto-cycle `cfg::kLayerCycleSecs` (default 30 s); touch resets timer. Realtime refresh `cfg::kRealtimeRefreshSecs` (default 3600 s / 60 min, scheduled on any page while awake; 300 s retry after weather/metadata failures); tiles only fetched on cache miss, zoom/style change, or refresh interval expiry.
 
 **Stall watchdog:** `pollRenderWatchdog()` in `loop()`. If no progress for `cfg::kRenderStallWarnMs` (default 10 s), logs phase name, URL (redacted), and tile coordinates; repeats every `cfg::kRenderStallRepeatMs`.
 
@@ -66,12 +72,12 @@ Phases: `SLEEP_AWAKE` → `SLEEP_PENDING` (2 s countdown) → `SLEEP_DARK` (back
 
 **Render guard:** when `SLEEP_DARK` or `SLEEP_PENDING`, completed renders update layer cache but do not push to LCD; display restores from cache on wake.
 
-## WebUI Endpoints (Core 0)
+## WebUI Endpoints (Arduino Main Task)
 
 | Endpoint | Method | Notes |
 |:---------|:-------|:------|
 | `/` | GET | Embedded HTML: live TFT mirror, layer status, render progress |
-| `/api/status` | GET | JSON: frame version, render state/progress, cache ages, heap/PSRAM/RSSI |
+| `/api/status` | GET | JSON: firmwareVersion (kFwVersion), frame version, render state/progress, cache ages, heap/PSRAM/RSSI |
 | `/screen.bmp` | GET | Current TFT as 24-bit BMP (800×480, RGB888) |
 | `/api/touch` | POST | Inject touch — JSON `{"x":N,"y":N}` or query params |
 | `/api/config` | POST | Update config keys: `zoom`, `radarAlpha`, `cloudAlpha`, `rainAlpha`, `sleepEnabled`, `sleepOnTime`, `sleepOffTime` ("HH:MM"). Changes saved to NVS immediately. |
@@ -89,3 +95,25 @@ Phases: `SLEEP_AWAKE` → `SLEEP_PENDING` (2 s countdown) → `SLEEP_DARK` (back
 | Zone | Area | Action |
 |:-----|:-----|:--------|
 | Layer badge |
+## Phase 3 public installer and device setup (1.5.8)
+
+`FIRMWARE_VERSION` is the literal shared identity; `kFwVersion` aliases it.
+The WebUI renders it in initial HTML and polls the same `/api/status` value.
+`PROJECT_NAME = "ESP32S3-Weather"` must stay stable for browser Update recognition.
+
+`build_credentials.h` conditionally includes secrets only in personal builds.
+`esp32s3-7inch-public` defines WEATHER_PUBLIC_BUILD and is the only labeled
+installer environment. Public defaults contain no keys/passwords.
+
+DeviceSettings is loaded once before WiFi/render startup from `weatherdev` NVS.
+GET `/api/device` returns public config and credential presence; POST validates,
+saves one blob and schedules reboot. Worker configuration remains immutable.
+No OTA listener starts until an OTA password is configured.
+
+Improv owns native USB Serial/JTAG via HWCDC, independent of existing UART logs,
+and runs every 20 ms on Core 0 from early setup. Its vendored library contains
+the shared parser fixes plus weather bounds checks. Physical tests are pending.
+
+Public packaging uses `tools/merge_bin.py`, then `tools/package_installer.py`
+with the shared tooling checkout. See `docs/WEB_INSTALLER.md`; do not publish
+merged images or personal-build artifacts. The remote workflow/hub are Phase 4.

@@ -1,5 +1,35 @@
 # Enhancement Requests
 
+## WebUI Format Refresh — Health App Template
+
+Implemented in firmware 1.5.9: paper/green theme, Dashboard / Settings / System
+sections, responsive forms and always-visible version. Board acceptance and a
+real WebUI screenshot remain pending.
+
+Requested 12 October 2026; planned for Phase 6.
+
+Use the Health App project at `../Health-App` as the visual template, particularly
+`public/index.html`, `public/style.css`, and the System / Diagnostics page.
+Adapt its warm paper background, green accents, system typography, white cards,
+clear section headings, spacing, and consistent form/button treatments to the
+weather dashboard.
+
+Organize the WebUI around the TFT mirror and weather status, overlay/view
+controls, night settings, and a separate system/diagnostics section. Keep the
+running firmware version, successful-data age, retry state, and layer-cache
+status easy to find. Include the existing social/footer tidy-up in this work.
+
+Implement with the ESP32's existing embedded HTML/CSS/JavaScript, adapting the
+Health App's visual patterns to fit the device's memory and serving constraints.
+Retain mirror touch input, current controls, settings persistence, and existing
+API behavior.
+
+Acceptance: compare desktop and phone layouts with the Health App reference;
+check readable status/error states, keyboard focus and touch-sized controls;
+verify mirror polling, all controls and firmware/data-age reporting; measure
+page size, free heap and responsiveness during polling. Add the resulting WebUI
+screenshot to README in place of the current placeholder.
+
 ## Base Map Cache Separation
 
 ### Problem
