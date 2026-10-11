@@ -445,5 +445,8 @@ README includes a clearly labelled design preview; replace with a real board
 WebUI screenshot after acceptance. The remaining
 Phase 6 maintenance tasks are still open.
 
-Phases 4–5 web installer integration/publication are PAUSED at the user's
-request while separate installer work proceeds. Do not resume without instruction.
+Phases 4–5 resumed 12 October 2026 at the user's instruction. Done locally:
+caller workflow (`envs: esp32s3-7inch-public`, shared tooling `@main`) and a
+`7″` board label for the hub size filter. Remaining: push `dev` and check the
+`site-preview`, one-time Pages/tag-rule setup, hardware acceptance, `v*`
+release from `main`, then the hub `projects.json` entry. Ask before each push.

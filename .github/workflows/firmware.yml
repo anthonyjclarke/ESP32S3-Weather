@@ -1,0 +1,14 @@
+# Builds the public installer image on each push and PR; a v* tag on main
+# publishes the release and installer. Only the public env is built: the
+# personal and OTA envs are local-only and must never be published.
+name: Firmware
+on:
+  push: { branches: [dev, main], tags: ["v*"] }
+  pull_request:
+  workflow_dispatch:
+jobs:
+  firmware:
+    uses: anthonyjclarke/cyd-web-installer/.github/workflows/cyd-release.yml@main
+    permissions: { contents: write, pages: write, id-token: write }
+    with:
+      envs: esp32s3-7inch-public

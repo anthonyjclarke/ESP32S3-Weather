@@ -10,7 +10,15 @@
 - Keep the running firmware version visible across all sections, preserve data
   age, cache states, mirror touch and all existing control/API behavior. Add
   mobile layouts, keyboard focus indicators and a scrollable cache table.
-- Web installer integration remains paused at the user's request.
+- Installer board label now includes `7″` so the hub's screen-size filter
+  recognises it.
+
+### Added
+
+- `.github/workflows/firmware.yml` calls the shared cyd-web-installer release
+  workflow, building only `esp32s3-7inch-public`. Pushes produce a
+  `site-preview` artifact; a `v*` tag on `main` publishes the release and
+  installer page.
 
 ### Validation
 
