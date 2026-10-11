@@ -7,7 +7,8 @@
 static constexpr uint8_t CH422G_ADDR_WR_SET = 0x24;
 static constexpr uint8_t CH422G_ADDR_WR_IO  = 0x38;
 
-static uint8_t ch422gWrIo = 0xFF;
+// All outputs high except USB_SEL: native USB carries Improv provisioning.
+static uint8_t ch422gWrIo = 0xFF & ~(1u << CH422G_USB_SEL);
 
 static void ch422gSetPin(uint8_t pin, uint8_t val) {
   if (val) {

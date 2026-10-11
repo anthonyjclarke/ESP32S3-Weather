@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.5.10] 12-10-2026
+
+### Fixed
+
+- Native USB never enumerated, so the web installer could not reach Improv.
+  The CH422G expander was initialised to `0xFF`, driving EXIO5 (`USB_SEL`)
+  high, which routes GPIO19/20 to the CAN transceiver. EXIO5 is now held low
+  (native USB); all other expander outputs are unchanged.
+
 ## [1.5.9] 12-10-2026
 
 ### Changed

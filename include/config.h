@@ -4,7 +4,7 @@
 
 // Identity shared by startup, WebUI, Improv and installer metadata. Keep the
 // project name stable so ESP Web Tools recognizes a settings-preserving Update.
-#define FIRMWARE_VERSION "1.5.9"
+#define FIRMWARE_VERSION "1.5.10"
 #define IMPROV_SETUP_ENABLED 1
 constexpr const char* PROJECT_NAME = "ESP32S3-Weather";
 constexpr const char* PROJECT_REPO_URL = "https://github.com/anthonyjclarke/ESP32S3-Weather";
@@ -132,6 +132,7 @@ constexpr int GT911_INT_PIN = 4;
 constexpr uint8_t CH422G_TP_RST  = 1;
 constexpr uint8_t CH422G_LCD_BL  = 2;
 constexpr uint8_t CH422G_LCD_RST = 3;
+constexpr uint8_t CH422G_USB_SEL = 5;  // low = native USB on GPIO19/20, high = CAN
 
 constexpr bool TOUCH_SWAP_XY  = false;
 constexpr bool TOUCH_INVERT_X = false;

@@ -24,8 +24,14 @@ release workflow and hub, and Phase 5 records hardware install/update tests.
 
 The Waveshare board has native USB and a separate USB-to-UART connection.
 Use the **native USB port** for this project's Improv listener. UART logging and
-its existing configuration are preserved. Browser access and cold-boot USB
-reconnection still need physical tests.
+its existing configuration are preserved. Cold-boot USB reconnection still
+needs a physical test.
+
+GPIO19/20 are shared between native USB and CAN, selected by CH422G EXIO5
+(`USB_SEL`, low = USB). Firmware before 1.5.10 drove every expander output high,
+so native USB never enumerated and Improv could not answer. 1.5.10 holds EXIO5
+low. On the UART port (WCH CH343, vendor `0x1A86`) the installer shows only
+Install, because Improv does not listen there.
 [Waveshare hardware documentation](https://docs.waveshare.com/ESP32-S3-Touch-LCD-7).
 
 The process reuses [cyd-web-installer](https://github.com/anthonyjclarke/cyd-web-installer)
@@ -153,7 +159,13 @@ provisioning. Logs never include passwords.
 - WebUI JavaScript syntax check and built initial version-label check: PASS.
 - Phase 2 native weather validation/timing/graph tests retained.
 
-## Hardware acceptance still pending
+## Hardware acceptance
+
+Recorded 12-10-2026: 1.5.10 flashed via UART with PlatformIO; on the native
+USB port the CI `site-preview` (1.5.9) connected and Improv reported
+`ESP32S3-Weather` 1.5.10. Same-firmware recognition over native USB: PASS.
+
+Still pending:
 
 1. Confirm visible LCD, working touch, WebUI version 1.5.8 and hourly cadence.
 2. Erased first install: Improv responds during the captive portal and startup

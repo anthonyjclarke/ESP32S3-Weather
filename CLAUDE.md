@@ -8,7 +8,7 @@ Live weather dashboard with slippy-map base tiles (Carto dark / OpenTopoMap / OS
 
 All 16 RGB data pins (`cfg::kPinD0`–`cfg::kPinD15`) plus DE/VSYNC/HSYNC/PCLK are in `include/config.h` namespace `cfg::`, passed to `Bus_RGB` at runtime in `waveshare_display.h`.
 
-CH422G expander (I2C control) logical pins: `CH422G_TP_RST` = 1 (GT911 reset), `CH422G_LCD_BL` = 2 (backlight), `CH422G_LCD_RST` = 3 (panel reset).
+CH422G expander (I2C control) logical pins: `CH422G_TP_RST` = 1 (GT911 reset), `CH422G_LCD_BL` = 2 (backlight), `CH422G_LCD_RST` = 3 (panel reset), `CH422G_USB_SEL` = 5 (**must stay low** — high routes GPIO19/20 to CAN and native USB/Improv disappears).
 
 ## Hardware Quirks & Workarounds
 
