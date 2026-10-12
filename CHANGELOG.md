@@ -19,6 +19,14 @@
 - The POSIX timezone field moves under **Advanced** and remains available for
   custom strings. Stored settings and the `/api/device` contract are unchanged.
 
+### Fixed
+
+- Forecast never loaded for many locations (e.g. Europe, South Asia). Open-Meteo
+  returns null for the final day(s) when the model horizon ends before local
+  midnight, and the validator rejected the whole response. Today is still
+  required in full; missing later days are stored as NAN / code -1 and drawn as
+  gaps on the graph pages and `--` in the 3-day strip.
+
 ## [1.5.10] 12-10-2026
 
 ### Fixed

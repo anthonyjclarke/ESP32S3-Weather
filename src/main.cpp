@@ -2095,14 +2095,14 @@ void drawBottomDashboard() {
     lcd.setTextColor(TFT_LIGHTGREY);
     lcd.setTextDatum(top_center);
     lcd.drawString(timeOk ? days[dayIdx] : "--", cx, 480 - 57);
-    if (weatherHasData) drawWeatherIcon(curX + 25, 480 - 28, dCode[i]);
+    if (weatherHasData && dCode[i] >= 0) drawWeatherIcon(curX + 25, 480 - 28, dCode[i]);
     lcd.setTextColor(TFT_WHITE);
     lcd.setTextSize(2);
     lcd.setTextDatum(top_left);
-    if (weatherHasData) lcd.drawNumber((int)dMax[i], curX + 59, 480 - 42);
+    if (weatherHasData && std::isfinite(dMax[i])) lcd.drawNumber((int)dMax[i], curX + 59, 480 - 42);
     else lcd.drawString("--", curX + 59, 480 - 42);
     lcd.setTextColor(0x7BEF);
-    if (weatherHasData) lcd.drawNumber((int)dMin[i], curX + 59, 480 - 22);
+    if (weatherHasData && std::isfinite(dMin[i])) lcd.drawNumber((int)dMin[i], curX + 59, 480 - 22);
     else lcd.drawString("--", curX + 59, 480 - 22);
   }
   markScreenUpdated();
@@ -2302,6 +2302,7 @@ lcd.drawString(unitTxt, 370, 448 );
     for (int i = 0; i < 15; i++) {
       int x1 = sX + (i * dW) + (dW / 2);
       float v1 = dCloud[i], v2 = dCloud[i + 1];
+      if (!std::isfinite(v1) || !std::isfinite(v2)) continue;  // missing trailing day
       for (int px = 0; px < dW; px++) {
         float interVal = v1 + (v2 - v1) * (float)px / dW;
         int interY = graphCoordinate(interVal, minV, maxV, sY, eY);
@@ -2353,7 +2354,7 @@ lcd.drawString(unitTxt, 370, 448 );
     lcd.drawString(dayShort2[wD], x1, eY - 46);
 
     // Mini icon only on T
-    if (type == 1) {
+    if (type == 1 && dCode[i] >= 0) {
       drawMiniWeatherIcon(x1, eY - 17, dCode[i]);
     }
 
@@ -2367,6 +2368,7 @@ lcd.drawString(unitTxt, 370, 448 );
     if (type == 3 || type == 8) {
       float barVal = (type == 3) ? dRain[i] : dSolar[i];
       uint16_t barCol = (type == 3) ? TFT_BLUE : TFT_YELLOW;
+      if (!std::isfinite(barVal)) continue;  // missing trailing day: no bar
 
       int barH = graphCoordinate(barVal, 0, maxV, 0, sY - eY);
       lcd.fillRect(x1 - 15, sY - barH, 30, barH, barCol);
@@ -2403,7 +2405,9 @@ lcd.drawString(unitTxt, 370, 448 );
         col = TFT_MAGENTA;
       }
 
-      int y1 = graphCoordinate(val1, minV, maxV, sY, eY);
+      // Missing (NAN) values are skipped: no point, and no line to or from them.
+      const bool has1 = std::isfinite(val1);
+      int y1 = has1 ? graphCoordinate(val1, minV, maxV, sY, eY) : 0;
 
       if (i < 15) {
         float val2 = 0;
@@ -2416,20 +2420,24 @@ lcd.drawString(unitTxt, 370, 448 );
         else if (type == 7) val2 = dUV[i + 1];
 
         int x2 = sX + ((i + 1) * dW) + (dW / 2);
-        int y2 = graphCoordinate(val2, minV, maxV, sY, eY);
-        lcd.drawLine(x1, y1, x2, y2, col);
+        if (has1 && std::isfinite(val2)) {
+          int y2 = graphCoordinate(val2, minV, maxV, sY, eY);
+          lcd.drawLine(x1, y1, x2, y2, col);
+        }
 
-        if (type == 1) {
+        if (type == 1 && std::isfinite(dMin[i]) && std::isfinite(dMin[i + 1])) {
           int yMin1 = graphCoordinate(dMin[i], minV, maxV, sY, eY);
           int yMin2 = graphCoordinate(dMin[i + 1], minV, maxV, sY, eY);
           lcd.drawLine(x1, yMin1, x2, yMin2, TFT_BLUE);
         }
       }
 
-      lcd.fillCircle(x1, y1, 4, col);
-      lcd.drawCircle(x1, y1, 4, TFT_WHITE);
+      if (has1) {
+        lcd.fillCircle(x1, y1, 4, col);
+        lcd.drawCircle(x1, y1, 4, TFT_WHITE);
+      }
 
-      if (type == 1) {
+      if (type == 1 && std::isfinite(dMin[i])) {
         int yMin = graphCoordinate(dMin[i], minV, maxV, sY, eY);
         lcd.fillCircle(x1, yMin, 4, TFT_BLUE);
         lcd.drawCircle(x1, yMin, 4, TFT_WHITE);

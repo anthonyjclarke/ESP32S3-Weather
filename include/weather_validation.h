@@ -36,14 +36,32 @@ inline bool readForecast(JsonVariantConst doc, ForecastData& out) {
     "shortwave_radiation_sum"
   };
   float* values[] = {out.dMax, out.dMin, out.dRain, out.dHum, out.dWind, out.dUV, out.dSolar};
+  // Open-Meteo returns null for the final day(s) in many timezones because the
+  // model horizon ends at a fixed UTC time. Today must be complete; a missing
+  // later value becomes NAN (code -1) and is drawn as a gap or "--".
   for (int day = 0; day < 16; ++day) {
+    bool complete = true;
     for (int field = 0; field < 7; ++field) {
-      if (!readForecastFloat(doc["daily"][dailyNames[field]][day], values[field][day])) return false;
+      if (!readForecastFloat(doc["daily"][dailyNames[field]][day], values[field][day])) {
+        values[field][day] = NAN;
+        complete = false;
+      }
     }
-    if (!doc["daily"]["weather_code"][day].is<int>() ||
-        !readForecastFloat(doc["hourly"]["pressure_msl"][day * 24 + 12], out.dPress[day]) ||
-        !readForecastFloat(doc["hourly"]["cloud_cover"][day * 24 + 12], out.dCloud[day])) return false;
-    out.dCode[day] = doc["daily"]["weather_code"][day].as<int>();
+    if (!readForecastFloat(doc["hourly"]["pressure_msl"][day * 24 + 12], out.dPress[day])) {
+      out.dPress[day] = NAN;
+      complete = false;
+    }
+    if (!readForecastFloat(doc["hourly"]["cloud_cover"][day * 24 + 12], out.dCloud[day])) {
+      out.dCloud[day] = NAN;
+      complete = false;
+    }
+    if (doc["daily"]["weather_code"][day].is<int>()) {
+      out.dCode[day] = doc["daily"]["weather_code"][day].as<int>();
+    } else {
+      out.dCode[day] = -1;
+      complete = false;
+    }
+    if (day == 0 && !complete) return false;
   }
   return true;
 }
