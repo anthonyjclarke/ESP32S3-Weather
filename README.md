@@ -98,7 +98,9 @@ coordinate back to the device.
 
 ## Location Settings
 
-Set location and timezone in **Device setup** in the WebUI. Saved NVS values
+Set location and timezone in **Device setup** in the WebUI: search for your
+town, pick it, and the coordinates and timezone fill in, with a preview of the
+local time and next daylight-saving change. Saved NVS values
 override build defaults. Personal build defaults remain near the top of
 `include/config.h`:
 

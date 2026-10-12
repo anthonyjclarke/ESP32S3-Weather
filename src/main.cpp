@@ -26,6 +26,7 @@
 #include "device_settings.h"
 #include "improv_setup.h"
 #include "touch.h"
+#include "tz_zones.h"
 #include "waveshare_display.h"
 
 
@@ -850,6 +851,10 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; } .form-grid label { font-size:12px; color:var(--muted); } .wide { grid-column:1/-1; }
     input:not([type=checkbox]):not([type=range]) { background:white; border:1px solid #cbd5cc; border-radius:6px; color:var(--text); padding:10px; width:100%; min-height:44px; margin-top:5px; }
     .check { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:13px; margin:14px 0; } input[type=checkbox] { accent-color:var(--accent); width:18px; height:18px; flex-shrink:0; }
+    .search-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin-bottom:16px; } .search-row label { font-size:12px; color:var(--muted); }
+    .place-results { display:grid; gap:6px; margin:-6px 0 18px; font-size:13px; color:var(--muted); } .place-results button { background:white; color:var(--text); border-color:var(--line); text-align:left; } .place-results small { display:block; color:var(--muted); font-size:12px; }
+    .tz-preview { margin:0; font-size:13px; color:var(--muted); } .tz-preview strong { color:var(--text); font-weight:600; }
+    details summary { cursor:pointer; font-size:13px; color:var(--accent); padding:4px 0; } details label { display:block; margin-top:8px; }
     .actions { margin-top:18px; } #deviceResult { background:#e4ece2; border:1px solid #d3dfd0; padding:10px 14px; border-radius:7px; }
     .sched-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 0; border-bottom:1px solid var(--line); } .sched-row>label:first-child { font-size:13px; color:var(--muted); }
     .sched-row .time-input { width:145px!important; margin:0!important; } .sched-status { font-size:13px; color:var(--muted); margin:12px 0; line-height:1.8; }
@@ -911,12 +916,22 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     </section>
     <section id="settings" aria-label="Settings" hidden><div class="grid settings-grid"><section class="card">
       <h2>Device setup</h2>
-      <p class="dim">Set your location and POSIX timezone. Saving restarts the dashboard.</p>
+      <p class="dim">Search for your town to fill in the location and timezone, check the local time, then save. Saving restarts the dashboard.</p>
+      <form id="placeForm" class="search-row" role="search">
+        <label>Find a place <input id="placeQuery" maxlength="80" placeholder="Town or city, e.g. Putney" autocomplete="off"></label>
+        <button type="submit">Search</button>
+      </form>
+      <div id="placeResults" class="place-results" aria-live="polite" hidden></div>
       <form id="deviceForm" >
         <div class="form-grid"><label class="wide">Location name <input id="deviceLocation" maxlength="63" required></label>
         <label>Latitude <input id="deviceLat" type="number" step="any" min="-85.05112878" max="85.05112878" required></label>
         <label>Longitude <input id="deviceLon" type="number" step="any" min="-180" max="180" required></label>
-        <label class="wide">POSIX timezone <input id="deviceTimezone" maxlength="95" required></label>
+        <label class="wide">Timezone <input id="deviceTzName" list="tzNames" placeholder="e.g. Australia/Sydney" autocomplete="off" spellcheck="false"></label>
+        <datalist id="tzNames"></datalist>
+        <p id="tzPreview" class="wide tz-preview" role="status">Loading timezones...</p>
+        <details id="tzAdvanced" class="wide"><summary>Advanced: POSIX timezone string</summary>
+          <label>POSIX TZ (set automatically from the timezone above) <input id="deviceTimezone" maxlength="95" required spellcheck="false"></label>
+        </details>
         <label>New OpenWeatherMap key <input id="deviceOwm" type="password" maxlength="128" autocomplete="new-password"></label>
         <label>New OTA password <input id="deviceOta" type="password" maxlength="63" autocomplete="new-password"></label>
         </div><label class="check"><input id="clearOwm" type="checkbox"> Clear saved OWM key</label>
@@ -1182,6 +1197,127 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
     });
     sleepForcedEl.addEventListener('change', () => setConfig({ sleepForce: sleepForcedEl.checked }));
 
+    // Timezone picker: users choose an IANA name; the device stores the POSIX
+    // string it maps to (table served by the firmware at /tz.json).
+    const tzZones = {};
+    const tzNameEl = document.getElementById('deviceTzName');
+    const tzPosixEl = document.getElementById('deviceTimezone');
+    const tzPreviewEl = document.getElementById('tzPreview');
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const tzReady = (async () => {
+      try {
+        const response = await fetch('/tz.json');
+        if (!response.ok) throw new Error();
+        Object.assign(tzZones, await response.json());
+        document.getElementById('tzNames').replaceChildren(...Object.keys(tzZones).map(name =>
+          Object.assign(document.createElement('option'), { value: name })));
+      } catch (error) { document.getElementById('tzAdvanced').open = true; }
+    })();
+    // Several zones share one POSIX string; prefer the browser's own zone.
+    function tzNameForPosix(posix) {
+      if (tzZones[browserTz] === posix) return browserTz;
+      return Object.keys(tzZones).find(name => tzZones[name] === posix) || '';
+    }
+    function describeZone(name) {
+      const now = new Date();
+      const clock = new Intl.DateTimeFormat(undefined, { timeZone: name, weekday: 'short', hour: '2-digit', minute: '2-digit' }).format(now);
+      const offsetFmt = new Intl.DateTimeFormat('en-US', { timeZone: name, timeZoneName: 'longOffset' });
+      const offsetAt = date => offsetFmt.formatToParts(date).find(part => part.type === 'timeZoneName').value.replace('GMT', 'UTC');
+      const current = offsetAt(now);
+      for (let day = 1; day <= 366; day++) {
+        let hi = now.getTime() + day * 86400000;
+        if (offsetAt(new Date(hi)) === current) continue;
+        let lo = hi - 86400000;
+        while (hi - lo > 60000) { const mid = (lo + hi) / 2; if (offsetAt(new Date(mid)) === current) lo = mid; else hi = mid; }
+        const when = new Date(hi).toLocaleDateString(undefined, { timeZone: name, day: 'numeric', month: 'short', year: 'numeric' });
+        return [clock, `${current}, changes to ${offsetAt(new Date(hi))} on ${when}`];
+      }
+      return [clock, `${current}, no daylight saving`];
+    }
+    function updateTzPreview(note = '') {
+      const name = tzNameEl.value;
+      tzPreviewEl.replaceChildren();
+      if (name && !tzZones[name]) {
+        tzPreviewEl.textContent = 'Choose a timezone from the list.';
+      } else if (name) {
+        try {
+          const [clock, detail] = describeZone(name);
+          const strong = document.createElement('strong');
+          strong.textContent = clock;
+          tzPreviewEl.append('Local time there: ', strong, ` (${detail})`);
+        } catch (error) { tzPreviewEl.textContent = `Timezone ${name}.`; }
+      } else {
+        tzPreviewEl.textContent = tzPosixEl.value ? 'Using a custom POSIX string; no preview available.' : 'Choose a timezone.';
+      }
+      if (note) tzPreviewEl.append(' ', note);
+    }
+    function setTimezone(name, note = '') {
+      if (!tzZones[name]) return false;
+      tzNameEl.value = name;
+      tzPosixEl.value = tzZones[name];
+      updateTzPreview(note);
+      return true;
+    }
+    async function zoneForCoordinates(lat, lon) {
+      const response = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&timezone=auto`);
+      if (!response.ok) throw new Error();
+      return (await response.json()).timezone;
+    }
+    tzNameEl.addEventListener('input', () => {
+      if (tzZones[tzNameEl.value]) tzPosixEl.value = tzZones[tzNameEl.value];
+      updateTzPreview();
+    });
+    tzPosixEl.addEventListener('input', () => {
+      if (tzZones[tzNameEl.value] !== tzPosixEl.value) tzNameEl.value = tzNameForPosix(tzPosixEl.value);
+      updateTzPreview();
+    });
+    tzPosixEl.addEventListener('invalid', () => { document.getElementById('tzAdvanced').open = true; });
+    ['deviceLat', 'deviceLon'].forEach(id => document.getElementById(id).addEventListener('change', async () => {
+      const lat = document.getElementById('deviceLat'), lon = document.getElementById('deviceLon');
+      if (!lat.value || !lon.value || !lat.checkValidity() || !lon.checkValidity()) return;
+      try { setTimezone(await zoneForCoordinates(lat.value, lon.value), 'Timezone set from the coordinates.'); } catch (error) {}
+    }));
+
+    const placeResults = document.getElementById('placeResults');
+    function choosePlace(place, label) {
+      document.getElementById('deviceLocation').value = label.slice(0, 63);
+      document.getElementById('deviceLat').value = place.latitude.toFixed(4);
+      document.getElementById('deviceLon').value = place.longitude.toFixed(4);
+      if (!setTimezone(place.timezone)) updateTzPreview(`Timezone ${place.timezone || 'unknown'} is not in the list; set it below.`);
+      placeResults.hidden = true;
+      if (Math.abs(place.latitude) > 85.05112878) document.getElementById('deviceLat').reportValidity();
+    }
+    document.getElementById('placeForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      // The geocoder matches place names only, so search the first part and use
+      // any ", State, Country" terms (or initials like NSW, UK) to rank results.
+      const [query, ...terms] = document.getElementById('placeQuery').value.split(',').map(term => term.trim().toLowerCase());
+      const initials = text => (text || '').split(/\s+/).map(word => word[0]).join('');
+      const score = place => terms.filter(term => term && [place.admin1, place.admin2, place.country, place.country_code, initials(place.admin1), initials(place.country)]
+        .some(field => field && field.toLowerCase().startsWith(term))).length;
+      placeResults.hidden = false;
+      if (query.length < 2) { placeResults.textContent = 'Type at least two letters of a town or city name.'; return; }
+      placeResults.textContent = 'Searching...';
+      try {
+        const response = await fetch(`https://geocoding-api.open-meteo.com/v1/search?count=20&language=en&format=json&name=${encodeURIComponent(query)}`);
+        if (!response.ok) throw new Error();
+        const places = ((await response.json()).results || []).sort((a, b) => score(b) - score(a)).slice(0, 8);
+        if (!places.length) { placeResults.textContent = `No places found for "${query}". Try just the town name.`; return; }
+        placeResults.replaceChildren(...places.map(place => {
+          const label = [place.name, place.admin1, place.country].filter(Boolean).join(', ');
+          const button = document.createElement('button');
+          const detail = document.createElement('small');
+          button.type = 'button';
+          detail.textContent = [place.admin2, `${place.latitude.toFixed(3)}, ${place.longitude.toFixed(3)}`, place.timezone].filter(Boolean).join(' · ');
+          button.append(label, detail);
+          button.addEventListener('click', () => choosePlace(place, label));
+          return button;
+        }));
+      } catch (error) {
+        placeResults.textContent = 'Place search needs internet access from this browser. You can still enter the coordinates below.';
+      }
+    });
+
     async function loadDeviceSettings() {
       const message = document.getElementById('deviceResult');
       try {
@@ -1192,6 +1328,14 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
         document.getElementById('deviceLat').value = settings.latitude;
         document.getElementById('deviceLon').value = settings.longitude;
         document.getElementById('deviceTimezone').value = settings.timezone;
+        await tzReady;
+        tzNameEl.value = tzNameForPosix(settings.timezone);
+        updateTzPreview();
+        zoneForCoordinates(settings.latitude, settings.longitude).then(zone => {
+          if (tzPosixEl.value !== settings.timezone) return;
+          if (tzZones[zone] === settings.timezone) { tzNameEl.value = zone; updateTzPreview(); }
+          else if (tzZones[zone]) updateTzPreview(`Note: the saved location is in ${zone}; pick it above if the clock is wrong.`);
+        }).catch(() => {});
         message.textContent = `OWM key: ${settings.hasOwmKey ? 'set' : 'not set'} · OTA: ${settings.otaEnabled ? 'enabled' : 'disabled'}`;
         document.getElementById('deviceSave').disabled = false;
         text('firmwareVersion', `v${settings.firmwareVersion}`);
@@ -1202,6 +1346,7 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
       const button = document.getElementById('deviceSave');
       const message = document.getElementById('deviceResult');
       const value = id => document.getElementById(id).value;
+      if (tzNameEl.value && !tzZones[tzNameEl.value]) { message.textContent = 'Choose a timezone from the list, or clear it and set the POSIX string.'; return; }
       button.disabled = true;
       try {
         const response = await fetch('/api/device', {
@@ -1231,6 +1376,12 @@ const char kWebUiHtml[] PROGMEM = R"HTML(
 
 void handleWebRoot() {
   webServer.send_P(200, "text/html", kWebUiHtml);
+}
+
+// IANA -> POSIX table for the Settings timezone picker; static per firmware.
+void handleWebTzZones() {
+  webServer.sendHeader("Cache-Control", "max-age=86400");
+  webServer.send_P(200, "application/json", kTzZonesJson);
 }
 
 void handleWebStatus() {
@@ -1539,6 +1690,7 @@ void setupWebUi(bool wifiOk) {
   webServer.on("/api/config", HTTP_POST, handleWebConfig);
   webServer.on("/api/device", HTTP_GET, handleWebDeviceSettings);
   webServer.on("/api/device", HTTP_POST, handleWebSaveDeviceSettings);
+  webServer.on("/tz.json", HTTP_GET, handleWebTzZones);
   webServer.on("/api/reboot", HTTP_POST, handleWebReboot);
   webServer.on("/api/reset-wifi", HTTP_POST, handleWebResetWifi);
   webServer.onNotFound([]() {
